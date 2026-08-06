@@ -222,6 +222,7 @@ class YamConfig(_FromKwargs):
     motor_temp_limit: float | None = None
     # Warn once per trial this many degrees below the configured thermal limit.
     motor_temp_warn_margin: float = 10.0
+    collision_hold_limit: int | None = 50
     # Wait for the arm to reach each commanded pose before observing, so a
     # chunked policy plans from a converged view. None disables the wait; a
     # tolerance must exceed the rig's steady-state offset (run
@@ -485,6 +486,12 @@ class YamConfig(_FromKwargs):
                 not isinstance(value, int) or isinstance(value, bool) or value < 16
             ):
                 raise ValueError(f"{key} must be an integer of at least 16 or unset")
+        if self.collision_hold_limit is not None and (
+            not isinstance(self.collision_hold_limit, int)
+            or isinstance(self.collision_hold_limit, bool)
+            or self.collision_hold_limit < 0
+        ):
+            raise ValueError("collision_hold_limit must be a non-negative integer or None")
         valid_realsense_capture = {"inline", "process"}
         if self.realsense_capture not in valid_realsense_capture:
             raise ValueError(
