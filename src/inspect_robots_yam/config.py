@@ -146,6 +146,19 @@ class YamConfig(_FromKwargs):
     gripper_stroke_s: float = 1.0
     cam_height: int = 224
     cam_width: int = 224
+    # Native capture size requested from the camera before the resize to
+    # cam_width x cam_height. 640 x 480 is what every rig has used so far;
+    # raise it (e.g. 1920 x 1080) when a policy needs full-resolution frames,
+    # such as AprilTag detection of small tags. Applies to the RealSense paths
+    # (colour and depth streams; intrinsics scale from this size) and to the
+    # V4L2/OpenCV path (CAP_PROP_FRAME_WIDTH/HEIGHT).
+    capture_width: int = 640
+    capture_height: int = 480
+    # Optional separate size for the RealSense depth stream. None means "same
+    # as the colour capture". Depth is aligned to the colour frame, so a D435
+    # can run colour at 1920 x 1080 with depth at its 1280 x 720 maximum.
+    depth_capture_width: int | None = None
+    depth_capture_height: int | None = None
     joint_low: tuple[float, ...] = _DEFAULT_LOW
     joint_high: tuple[float, ...] = _DEFAULT_HIGH
     control_interface: str = "joints"
@@ -320,6 +333,13 @@ class YamConfig(_FromKwargs):
             )
         return super().from_kwargs(**flat)
 
+    @property
+    def depth_capture_size(self) -> tuple[int, int] | None:
+        """The RealSense depth stream size, or None to match the colour capture."""
+        if self.depth_capture_width is None or self.depth_capture_height is None:
+            return None
+        return (self.depth_capture_width, self.depth_capture_height)
+
     def __post_init__(self) -> None:
         """Reject values that violate the 14-D packing and hardware invariants.
 
@@ -452,6 +472,19 @@ class YamConfig(_FromKwargs):
             raise ValueError("rest_secs must be > 0")
         if self.max_steps_hint is not None and self.max_steps_hint < 1:
             raise ValueError("max_steps_hint must be >= 1")
+        for key in ("capture_width", "capture_height"):
+            value = getattr(self, key)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 16:
+                raise ValueError(f"{key} must be an integer of at least 16")
+        depth_pair = (self.depth_capture_width, self.depth_capture_height)
+        if (depth_pair[0] is None) != (depth_pair[1] is None):
+            raise ValueError("depth_capture_width and depth_capture_height must be set together")
+        for key in ("depth_capture_width", "depth_capture_height"):
+            value = getattr(self, key)
+            if value is not None and (
+                not isinstance(value, int) or isinstance(value, bool) or value < 16
+            ):
+                raise ValueError(f"{key} must be an integer of at least 16 or unset")
         valid_realsense_capture = {"inline", "process"}
         if self.realsense_capture not in valid_realsense_capture:
             raise ValueError(

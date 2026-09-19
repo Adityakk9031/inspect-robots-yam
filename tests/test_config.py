@@ -785,3 +785,28 @@ def test_collision_bool_flags_reject_non_bool_values(flag: str, value: object) -
 def test_default_collision_flag_does_not_reject_unsupported_contribution_modes() -> None:
     assert YamConfig(control_interface="eef_pos").collision_guardrail is True
     assert YamConfig(joints_are_delta=True).collision_guardrail is True
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("capture_width", 8), ("capture_height", 0), ("capture_width", True), ("capture_height", 4.0)],
+)
+def test_capture_size_must_be_a_reasonable_integer(field: str, value: object) -> None:
+    with pytest.raises(ValueError, match=f"{field} must be an integer of at least 16"):
+        YamConfig(**{field: value})  # type: ignore[arg-type]
+
+
+def test_capture_size_defaults_match_the_historical_640x480() -> None:
+    cfg = YamConfig()
+    assert (cfg.capture_width, cfg.capture_height) == (640, 480)
+    assert YamConfig(capture_width=1920, capture_height=1080).capture_width == 1920
+
+
+def test_depth_capture_size_defaults_to_none_and_pairs() -> None:
+    assert YamConfig().depth_capture_size is None
+    cfg = YamConfig(depth_capture_width=1280, depth_capture_height=720)
+    assert cfg.depth_capture_size == (1280, 720)
+    with pytest.raises(ValueError, match="must be set together"):
+        YamConfig(depth_capture_width=1280)
+    with pytest.raises(ValueError, match="depth_capture_height must be an integer of at least 16"):
+        YamConfig(depth_capture_width=1280, depth_capture_height=8)

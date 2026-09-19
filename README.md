@@ -360,6 +360,18 @@ in-process reader as a debugging escape hatch. `depth_fps` (default 30) sets
 both stream rates — devices accept only their discrete rates (D435/D405:
 6/15/30/60/90).
 
+Both camera paths capture at `capture_width × capture_height` (default
+640 × 480) and then resize to `cam_width × cam_height`; intrinsics are scaled
+from the capture size. Policies that need every pixel, such as AprilTag
+detection of small tags, set both pairs to the same full size
+(`capture_width = 1920`, `capture_height = 1080`, `cam_width = 1920`,
+`cam_height = 1080`). Devices accept only their discrete sizes: D435 colour
+goes to 1920 × 1080 but its depth stream tops out at 1280 × 720, so give depth
+its own size with `depth_capture_width = 1280`, `depth_capture_height = 720`
+(both or neither; default: same as colour). Depth is aligned to the colour
+frame, so the published depth array is always colour-sized. An unsupported
+combination fails at pipeline start with the librealsense error.
+
 Cameras open lazily, so the first `reset()` has a one-time warm-up cost while
 the pipelines start and deliver their first frames. A RealSense opened through
 librealsense cannot also be opened through V4L2—there can be only one streamer

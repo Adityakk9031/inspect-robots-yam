@@ -434,7 +434,8 @@ class _OpenCVCameraReader:
     at one frame interval instead, independent of the control rate.
 
     cv2 is imported on the first frame read and devices open then too, so
-    construction stays inert. Negotiates YUYV at 640x480 explicitly (RealSense
+    construction stays inert. Negotiates YUYV at the configured capture size,
+    640x480 by default (RealSense
     D435s return empty frames on cv2 defaults) and resizes to ``cam_width`` x
     ``cam_height`` RGB.
 
@@ -453,11 +454,13 @@ class _OpenCVCameraReader:
     def __init__(
         self,
         devices: Mapping[str, str],
+        capture_size: tuple[int, int] = (REALSENSE_CAPTURE_WIDTH, REALSENSE_CAPTURE_HEIGHT),
         cv2_module: Any | None = None,
         sleep_fn: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._devices = dict(devices)
+        self._capture_size = capture_size
         self._cv2 = cv2_module
         self._sleep = sleep_fn
         self._clock = clock
@@ -565,8 +568,8 @@ class _OpenCVCameraReader:
             raise RuntimeError(f"cannot open {name} at {device}")
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter.fourcc(*"YUYV"))
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._capture_size[0])
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._capture_size[1])
         cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 3000)
         cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 1000)
         for _ in range(10):  # warm up: first frames can be empty
@@ -655,7 +658,7 @@ def _opencv_camera_reader(cfg: YamConfig) -> CameraReader:
         )
         if device is not None
     }
-    return _OpenCVCameraReader(devices)
+    return _OpenCVCameraReader(devices, capture_size=(cfg.capture_width, cfg.capture_height))
 
 
 def _default_camera_reader(cfg: YamConfig) -> ImageMap:
@@ -680,6 +683,8 @@ class _RealsenseCameraReader:
         self,
         serials: Mapping[str, str],
         depth_fps: int = 30,
+        capture_size: tuple[int, int] = (REALSENSE_CAPTURE_WIDTH, REALSENSE_CAPTURE_HEIGHT),
+        depth_capture_size: tuple[int, int] | None = None,
         rs_module: Any | None = None,
         cv2_module: Any | None = None,
         sleep_fn: Callable[[float], None] = time.sleep,
@@ -687,6 +692,8 @@ class _RealsenseCameraReader:
     ) -> None:
         self._serials = dict(serials)
         self._depth_fps = depth_fps
+        self._capture_size = capture_size
+        self._depth_capture_size = depth_capture_size
         self._rs = rs_module
         self._cv2 = cv2_module
         self._sleep = sleep_fn
@@ -718,18 +725,12 @@ class _RealsenseCameraReader:
         for name in self._serials:
             pair, generation = self._latest(name)
             intrinsics = pair.intrinsics.copy()
-            intrinsics[0, 0] = (
-                float(pair.intrinsics[0, 0]) * cfg.cam_width / REALSENSE_CAPTURE_WIDTH
-            )
-            intrinsics[0, 2] = (
-                float(pair.intrinsics[0, 2]) * cfg.cam_width / REALSENSE_CAPTURE_WIDTH
-            )
-            intrinsics[1, 1] = (
-                float(pair.intrinsics[1, 1]) * cfg.cam_height / REALSENSE_CAPTURE_HEIGHT
-            )
-            intrinsics[1, 2] = (
-                float(pair.intrinsics[1, 2]) * cfg.cam_height / REALSENSE_CAPTURE_HEIGHT
-            )
+            sx = cfg.cam_width / cfg.capture_width
+            sy = cfg.cam_height / cfg.capture_height
+            intrinsics[0, 0] = float(pair.intrinsics[0, 0]) * sx
+            intrinsics[0, 2] = float(pair.intrinsics[0, 2]) * sx
+            intrinsics[1, 1] = float(pair.intrinsics[1, 1]) * sy
+            intrinsics[1, 2] = float(pair.intrinsics[1, 2]) * sy
             extra[f"{name}_intrinsics"] = intrinsics
             extra[f"{name}_depth"] = self._depth_thunk(
                 name, cfg.cam_width, cfg.cam_height, generation
@@ -862,20 +863,10 @@ class _RealsenseCameraReader:
         """
         rs_cfg = rs.config()
         rs_cfg.enable_device(serial)
-        rs_cfg.enable_stream(
-            rs.stream.color,
-            REALSENSE_CAPTURE_WIDTH,
-            REALSENSE_CAPTURE_HEIGHT,
-            rs.format.rgb8,
-            self._depth_fps,
-        )
-        rs_cfg.enable_stream(
-            rs.stream.depth,
-            REALSENSE_CAPTURE_WIDTH,
-            REALSENSE_CAPTURE_HEIGHT,
-            rs.format.z16,
-            self._depth_fps,
-        )
+        width, height = self._capture_size
+        depth_w, depth_h = self._depth_capture_size or self._capture_size
+        rs_cfg.enable_stream(rs.stream.color, width, height, rs.format.rgb8, self._depth_fps)
+        rs_cfg.enable_stream(rs.stream.depth, depth_w, depth_h, rs.format.z16, self._depth_fps)
         pipeline = rs.pipeline()
         profile = pipeline.start(rs_cfg)
         try:
@@ -986,6 +977,8 @@ class _ProcessRealsenseCameraReader:
         self,
         serials: Mapping[str, str],
         depth_fps: int = 30,
+        capture_size: tuple[int, int] = (REALSENSE_CAPTURE_WIDTH, REALSENSE_CAPTURE_HEIGHT),
+        depth_capture_size: tuple[int, int] | None = None,
         *,
         child_entry: Any = None,
         transport: _CaptureTransport | None = None,
@@ -1000,6 +993,8 @@ class _ProcessRealsenseCameraReader:
             else _CaptureProcess(
                 self._serials,
                 depth_fps,
+                capture_size=capture_size,
+                depth_capture_size=depth_capture_size,
                 child_entry=child_entry,
             )
         )
@@ -1028,18 +1023,12 @@ class _ProcessRealsenseCameraReader:
         for name in self._serials:
             snapshot = self._latest(name)
             intrinsics = snapshot.intrinsics.copy()
-            intrinsics[0, 0] = (
-                float(snapshot.intrinsics[0, 0]) * cfg.cam_width / REALSENSE_CAPTURE_WIDTH
-            )
-            intrinsics[0, 2] = (
-                float(snapshot.intrinsics[0, 2]) * cfg.cam_width / REALSENSE_CAPTURE_WIDTH
-            )
-            intrinsics[1, 1] = (
-                float(snapshot.intrinsics[1, 1]) * cfg.cam_height / REALSENSE_CAPTURE_HEIGHT
-            )
-            intrinsics[1, 2] = (
-                float(snapshot.intrinsics[1, 2]) * cfg.cam_height / REALSENSE_CAPTURE_HEIGHT
-            )
+            sx = cfg.cam_width / cfg.capture_width
+            sy = cfg.cam_height / cfg.capture_height
+            intrinsics[0, 0] = float(snapshot.intrinsics[0, 0]) * sx
+            intrinsics[0, 2] = float(snapshot.intrinsics[0, 2]) * sx
+            intrinsics[1, 1] = float(snapshot.intrinsics[1, 1]) * sy
+            intrinsics[1, 2] = float(snapshot.intrinsics[1, 2]) * sy
             extra[f"{name}_intrinsics"] = intrinsics
             extra[f"{name}_depth"] = self._depth_thunk(
                 name,
@@ -1274,11 +1263,17 @@ class YAMEmbodiment:
             if depth_serials:
                 if self._cfg.realsense_capture == "inline":
                     self._builtin_realsense_reader = _RealsenseCameraReader(
-                        depth_serials, self._cfg.depth_fps
+                        depth_serials,
+                        self._cfg.depth_fps,
+                        capture_size=(self._cfg.capture_width, self._cfg.capture_height),
+                        depth_capture_size=self._cfg.depth_capture_size,
                     )
                 else:
                     self._builtin_realsense_reader = _ProcessRealsenseCameraReader(
-                        depth_serials, self._cfg.depth_fps
+                        depth_serials,
+                        self._cfg.depth_fps,
+                        capture_size=(self._cfg.capture_width, self._cfg.capture_height),
+                        depth_capture_size=self._cfg.depth_capture_size,
                     )
                 builtin_readers.append(self._builtin_realsense_reader)
             if len(builtin_readers) == 1:
