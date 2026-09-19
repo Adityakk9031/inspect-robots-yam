@@ -8,6 +8,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `capture_width` / `capture_height` (default 640 × 480, unchanged behaviour)
+  set the native size requested from the cameras on both the RealSense and the
+  V4L2 paths, with intrinsics scaled from that size. Rigs that need every pixel
+  (AprilTag detection for `inspect-robots-jev`) can now capture at 1920 × 1080
+  ([plan 0032](plans/0032-configurable-capture-resolution.md)).
+
 - An opt-in motor thermal guardrail checks every arm and gripper before reset
   motion and before each step, warns as the configured limit approaches, and
   ends a hot trial on the grading screen while torque remains. This avoids the

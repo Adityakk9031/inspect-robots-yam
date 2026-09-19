@@ -334,12 +334,12 @@ def test_capture_process_cleans_up_partial_slot_allocation(
     calls = 0
     original_create = capture_proc._create_frame_slot
 
-    def fail_second_create() -> tuple[shared_memory.SharedMemory, _FrameSlotSpec]:
+    def fail_second_create(*args: int) -> tuple[shared_memory.SharedMemory, _FrameSlotSpec]:
         nonlocal calls
         calls += 1
         if calls == 2:
             raise RuntimeError("allocation failed")
-        shm, spec = original_create()
+        shm, spec = original_create(*args)
         names.append(spec.name)
         return shm, spec
 
@@ -387,8 +387,8 @@ def test_capture_process_cleans_up_when_process_start_fails() -> None:
     names: list[str] = []
     original_create = capture_proc._create_frame_slot
 
-    def recording_create() -> tuple[shared_memory.SharedMemory, _FrameSlotSpec]:
-        shm, spec = original_create()
+    def recording_create(*args: int) -> tuple[shared_memory.SharedMemory, _FrameSlotSpec]:
+        shm, spec = original_create(*args)
         names.append(spec.name)
         return shm, spec
 
@@ -418,8 +418,8 @@ def test_capture_process_cleans_up_when_pipe_creation_fails() -> None:
     names: list[str] = []
     original_create = capture_proc._create_frame_slot
 
-    def recording_create() -> tuple[shared_memory.SharedMemory, _FrameSlotSpec]:
-        shm, spec = original_create()
+    def recording_create(*args: int) -> tuple[shared_memory.SharedMemory, _FrameSlotSpec]:
+        shm, spec = original_create(*args)
         names.append(spec.name)
         return shm, spec
 
@@ -462,8 +462,8 @@ def test_capture_process_cleans_up_when_process_construction_fails() -> None:
     names: list[str] = []
     original_create = capture_proc._create_frame_slot
 
-    def recording_create() -> tuple[shared_memory.SharedMemory, _FrameSlotSpec]:
-        shm, spec = original_create()
+    def recording_create(*args: int) -> tuple[shared_memory.SharedMemory, _FrameSlotSpec]:
+        shm, spec = original_create(*args)
         names.append(spec.name)
         return shm, spec
 
@@ -496,8 +496,8 @@ def test_capture_process_unlinks_before_handshake_error(
     names: list[str] = []
     original_create = capture_proc._create_frame_slot
 
-    def recording_create() -> tuple[shared_memory.SharedMemory, _FrameSlotSpec]:
-        shm, spec = original_create()
+    def recording_create(*args: int) -> tuple[shared_memory.SharedMemory, _FrameSlotSpec]:
+        shm, spec = original_create(*args)
         names.append(spec.name)
         return shm, spec
 
@@ -523,8 +523,8 @@ def test_capture_process_timeout_unlinks_and_terminates_child(
     names: list[str] = []
     original_create = capture_proc._create_frame_slot
 
-    def recording_create() -> tuple[shared_memory.SharedMemory, _FrameSlotSpec]:
-        shm, spec = original_create()
+    def recording_create(*args: int) -> tuple[shared_memory.SharedMemory, _FrameSlotSpec]:
+        shm, spec = original_create(*args)
         names.append(spec.name)
         return shm, spec
 
@@ -617,6 +617,7 @@ def test_process_mode_embodiment_uses_fake_spawn_child(
         depth_fps: int,
         *,
         child_entry: Any = None,
+        **kwargs: Any,
     ) -> _CaptureProcess:
         del child_entry
         return _CaptureProcess(
@@ -1085,3 +1086,43 @@ def test_child_ignores_incomplete_framesets(
     finally:
         shm.close()
         shm.unlink()
+
+
+def test_capture_process_allocates_slots_at_the_configured_capture_size() -> None:
+    sizes: list[tuple[int, int]] = []
+    original_create = capture_proc._create_frame_slot
+
+    def recording_create(*args: int) -> tuple[shared_memory.SharedMemory, _FrameSlotSpec]:
+        shm, spec = original_create(*args)
+        sizes.append((spec.width, spec.height))
+        return shm, spec
+
+    class ClosableConnection:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    class ProcesslessContext:
+        def __init__(self) -> None:
+            self.connections = (ClosableConnection(), ClosableConnection())
+
+        def Event(self) -> threading.Event:
+            return threading.Event()
+
+        def Pipe(self) -> tuple[ClosableConnection, ClosableConnection]:
+            return self.connections
+
+        def Process(self, **_kwargs: Any) -> Any:
+            raise RuntimeError("process construction failed")
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(capture_proc, "_create_frame_slot", recording_create)
+        capture = _CaptureProcess(
+            {"top_cam": "S1"}, 30, capture_size=(16, 12), context=ProcesslessContext()
+        )
+        with pytest.raises(RuntimeError, match="process construction failed"):
+            capture.open(1)
+
+    assert sizes == [(16, 12)]

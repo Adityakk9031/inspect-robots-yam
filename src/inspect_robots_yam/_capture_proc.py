@@ -121,12 +121,14 @@ class _CaptureProcess:
         serials: Mapping[str, str],
         depth_fps: int,
         *,
+        capture_size: tuple[int, int] = (REALSENSE_CAPTURE_WIDTH, REALSENSE_CAPTURE_HEIGHT),
         child_entry: Any = None,
         context: Any = None,
         open_timeout_s: float = OPEN_TIMEOUT_S,
     ) -> None:
         self._serials = tuple(serials.items())
         self._depth_fps = depth_fps
+        self._capture_size = capture_size
         self._child_entry = _child_main if child_entry is None else child_entry
         self._context = context
         self._open_timeout_s = open_timeout_s
@@ -163,7 +165,7 @@ class _CaptureProcess:
         slots: dict[str, tuple[shared_memory.SharedMemory, _FrameSlotSpec]] = {}
         try:
             for name, _ in self._serials:
-                slots[name] = _create_frame_slot()
+                slots[name] = _create_frame_slot(*self._capture_size)
         except BaseException:
             _unlink_slots(slots)
             _close_slots(slots)
