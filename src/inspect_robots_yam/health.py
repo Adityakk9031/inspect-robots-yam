@@ -120,9 +120,23 @@ class HealthReport:
         return all(result.ok for result in (*self.cameras, *self.joints))
 
 
-def _default_reader_factory(name: str, device: str) -> HealthCameraReader:
-    """Build one inert OpenCV reader for one named device."""
-    return embodiment._OpenCVCameraReader({name: device})
+def _default_reader_factory(
+    name: str, device: str, *, capture_size: tuple[int, int] = (640, 480)
+) -> HealthCameraReader:
+    """Build one inert OpenCV reader for one named device at ``capture_size``."""
+    return embodiment._OpenCVCameraReader({name: device}, capture_size=capture_size)
+
+
+def _reader_factory_for(cfg: YamConfig, reader_factory: ReaderFactory) -> ReaderFactory:
+    """Bind the default factory to the rig's configured capture size; keep injected ones."""
+    if reader_factory is not _default_reader_factory:
+        return reader_factory
+    size = (cfg.capture_width, cfg.capture_height)
+
+    def factory(name: str, device: str) -> HealthCameraReader:
+        return _default_reader_factory(name, device, capture_size=size)
+
+    return factory
 
 
 def _default_write_montage(
@@ -282,6 +296,7 @@ def run_health(
     sleep_fn: Callable[[float], None] = time.sleep,
 ) -> HealthReport:
     """Run the requested checks once and release every constructed hardware handle."""
+    reader_factory = _reader_factory_for(cfg, reader_factory)
     cameras_configured = bool(_camera_devices(cfg))
     cameras_skipped = skip_cameras or not cameras_configured
     unchecked_cameras = _unchecked_depth_cameras(cfg)

@@ -366,8 +366,11 @@ from the capture size. Policies that need every pixel, such as AprilTag
 detection of small tags, set both pairs to the same full size
 (`capture_width = 1920`, `capture_height = 1080`, `cam_width = 1920`,
 `cam_height = 1080`). Devices accept only their discrete sizes: D435 colour
-goes to 1920 × 1080 but its depth stream tops out at 1280 × 720, and an
-unsupported combination fails at pipeline start with the librealsense error.
+goes to 1920 × 1080 but its depth stream tops out at 1280 × 720, so give depth
+its own size with `depth_capture_width = 1280`, `depth_capture_height = 720`
+(both or neither; default: same as colour). Depth is aligned to the colour
+frame, so the published depth array is always colour-sized. An unsupported
+combination fails at pipeline start with the librealsense error.
 
 Cameras open lazily, so the first `reset()` has a one-time warm-up cost while
 the pipelines start and deliver their first frames. A RealSense opened through

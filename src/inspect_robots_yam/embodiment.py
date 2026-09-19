@@ -684,6 +684,7 @@ class _RealsenseCameraReader:
         serials: Mapping[str, str],
         depth_fps: int = 30,
         capture_size: tuple[int, int] = (REALSENSE_CAPTURE_WIDTH, REALSENSE_CAPTURE_HEIGHT),
+        depth_capture_size: tuple[int, int] | None = None,
         rs_module: Any | None = None,
         cv2_module: Any | None = None,
         sleep_fn: Callable[[float], None] = time.sleep,
@@ -692,6 +693,7 @@ class _RealsenseCameraReader:
         self._serials = dict(serials)
         self._depth_fps = depth_fps
         self._capture_size = capture_size
+        self._depth_capture_size = depth_capture_size
         self._rs = rs_module
         self._cv2 = cv2_module
         self._sleep = sleep_fn
@@ -862,8 +864,9 @@ class _RealsenseCameraReader:
         rs_cfg = rs.config()
         rs_cfg.enable_device(serial)
         width, height = self._capture_size
+        depth_w, depth_h = self._depth_capture_size or self._capture_size
         rs_cfg.enable_stream(rs.stream.color, width, height, rs.format.rgb8, self._depth_fps)
-        rs_cfg.enable_stream(rs.stream.depth, width, height, rs.format.z16, self._depth_fps)
+        rs_cfg.enable_stream(rs.stream.depth, depth_w, depth_h, rs.format.z16, self._depth_fps)
         pipeline = rs.pipeline()
         profile = pipeline.start(rs_cfg)
         try:
@@ -975,6 +978,7 @@ class _ProcessRealsenseCameraReader:
         serials: Mapping[str, str],
         depth_fps: int = 30,
         capture_size: tuple[int, int] = (REALSENSE_CAPTURE_WIDTH, REALSENSE_CAPTURE_HEIGHT),
+        depth_capture_size: tuple[int, int] | None = None,
         *,
         child_entry: Any = None,
         transport: _CaptureTransport | None = None,
@@ -990,6 +994,7 @@ class _ProcessRealsenseCameraReader:
                 self._serials,
                 depth_fps,
                 capture_size=capture_size,
+                depth_capture_size=depth_capture_size,
                 child_entry=child_entry,
             )
         )
@@ -1261,12 +1266,14 @@ class YAMEmbodiment:
                         depth_serials,
                         self._cfg.depth_fps,
                         capture_size=(self._cfg.capture_width, self._cfg.capture_height),
+                        depth_capture_size=self._cfg.depth_capture_size,
                     )
                 else:
                     self._builtin_realsense_reader = _ProcessRealsenseCameraReader(
                         depth_serials,
                         self._cfg.depth_fps,
                         capture_size=(self._cfg.capture_width, self._cfg.capture_height),
+                        depth_capture_size=self._cfg.depth_capture_size,
                     )
                 builtin_readers.append(self._builtin_realsense_reader)
             if len(builtin_readers) == 1:

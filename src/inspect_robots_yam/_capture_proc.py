@@ -102,6 +102,9 @@ class _CaptureSpec:
     slots: tuple[tuple[str, _FrameSlotSpec], ...]
     generation: int
     stop_event: Any
+    #: Depth stream size; None means the slot (colour) size. Depth is aligned to
+    #: colour in the child, so the slot's depth buffer is always colour-sized.
+    depth_size: tuple[int, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -122,6 +125,7 @@ class _CaptureProcess:
         depth_fps: int,
         *,
         capture_size: tuple[int, int] = (REALSENSE_CAPTURE_WIDTH, REALSENSE_CAPTURE_HEIGHT),
+        depth_capture_size: tuple[int, int] | None = None,
         child_entry: Any = None,
         context: Any = None,
         open_timeout_s: float = OPEN_TIMEOUT_S,
@@ -129,6 +133,7 @@ class _CaptureProcess:
         self._serials = tuple(serials.items())
         self._depth_fps = depth_fps
         self._capture_size = capture_size
+        self._depth_capture_size = depth_capture_size
         self._child_entry = _child_main if child_entry is None else child_entry
         self._context = context
         self._open_timeout_s = open_timeout_s
@@ -184,6 +189,7 @@ class _CaptureProcess:
             slots=tuple((name, slot_spec) for name, (_, slot_spec) in slots.items()),
             generation=generation,
             stop_event=stop_event,
+            depth_size=self._depth_capture_size,
         )
         try:
             process = context.Process(
@@ -351,6 +357,7 @@ def _open_child_pipelines(
                 slots[name],
                 shms[name],
                 spec.generation,
+                depth_size=spec.depth_size,
             )
     except BaseException:
         for bundle in bundles.values():
@@ -367,8 +374,16 @@ def _open_child_pipeline(
     slot_spec: _FrameSlotSpec,
     shm: shared_memory.SharedMemory,
     generation: int,
+    *,
+    depth_size: tuple[int, int] | None = None,
 ) -> _ChildPipeline:
-    """Open, warm, and return one configured child-owned pipeline."""
+    """Open, warm, and return one configured child-owned pipeline.
+
+    ``depth_size`` lets the depth stream run smaller than colour (a D435 tops
+    out at 1280 x 720 depth); alignment to colour makes the published depth
+    colour-sized regardless.
+    """
+    depth_w, depth_h = depth_size if depth_size is not None else (slot_spec.width, slot_spec.height)
     rs_cfg = rs.config()
     rs_cfg.enable_device(serial)
     rs_cfg.enable_stream(
@@ -378,13 +393,7 @@ def _open_child_pipeline(
         rs.format.rgb8,
         depth_fps,
     )
-    rs_cfg.enable_stream(
-        rs.stream.depth,
-        slot_spec.width,
-        slot_spec.height,
-        rs.format.z16,
-        depth_fps,
-    )
+    rs_cfg.enable_stream(rs.stream.depth, depth_w, depth_h, rs.format.z16, depth_fps)
     pipeline = rs.pipeline()
     profile = pipeline.start(rs_cfg)
     try:

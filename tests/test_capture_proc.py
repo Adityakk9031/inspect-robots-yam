@@ -612,6 +612,8 @@ def test_process_reader_reports_stale_live_and_dead_spawn_children() -> None:
 def test_process_mode_embodiment_uses_fake_spawn_child(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    forwarded: list[dict[str, Any]] = []
+
     def capture_factory(
         serials: dict[str, str],
         depth_fps: int,
@@ -620,6 +622,7 @@ def test_process_mode_embodiment_uses_fake_spawn_child(
         **kwargs: Any,
     ) -> _CaptureProcess:
         del child_entry
+        forwarded.append(kwargs)
         return _CaptureProcess(
             serials,
             depth_fps,
@@ -637,6 +640,7 @@ def test_process_mode_embodiment_uses_fake_spawn_child(
             right_depth_serial="ready-right",
         )
     )
+    assert forwarded == [{"capture_size": (640, 480), "depth_capture_size": None}]
     reader = emb._builtin_realsense_reader
 
     assert isinstance(reader, _ProcessRealsenseCameraReader)
@@ -1126,3 +1130,35 @@ def test_capture_process_allocates_slots_at_the_configured_capture_size() -> Non
             capture.open(1)
 
     assert sizes == [(16, 12)]
+
+
+def test_child_enables_depth_at_its_own_size_when_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shm, slot_spec = _create_frame_slot()  # default 640 x 480 colour slot
+    stop = threading.Event()
+    pipeline = FakePipeline([(True, frameset()), (True, frameset())])
+    pipeline.stop_after(stop, 2)
+    rs = FakeRs([pipeline])
+    parent_conn, child_conn = multiprocessing.Pipe()
+    _record_unregisters(monkeypatch)
+    spec = _CaptureSpec(
+        serials=(("top_cam", "S1"),),
+        depth_fps=15,
+        slots=(("top_cam", slot_spec),),
+        generation=1,
+        stop_event=stop,
+        depth_size=(320, 240),
+    )
+    try:
+        _child_main(child_conn, spec, rs_module=rs)
+        assert parent_conn.recv() == ("ready", {"slots": ("top_cam",)})
+        assert rs.configs[0].streams == [
+            ("colour", 640, 480, "rgb8", 15),
+            ("depth", 320, 240, "z16", 15),
+        ]
+    finally:
+        parent_conn.close()
+        child_conn.close()
+        shm.close()
+        shm.unlink()

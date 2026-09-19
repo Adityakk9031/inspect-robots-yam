@@ -27,6 +27,9 @@ all used the constants.
   and `cfg.cam_height / cfg.capture_height` instead of the constants.
 - `_OpenCVCameraReader(devices, capture_size=...)` negotiates the size with
   V4L2; `_opencv_camera_reader(cfg)` passes the configured size.
+- `YamConfig.depth_capture_width/height` (optional, both or neither) give the
+  RealSense depth stream its own size; `_CaptureSpec.depth_size` carries it to
+  the child, and the inline reader honours it too.
 - The constants remain as the defaults of every new parameter.
 
 **Not changed:** the resize to `cam_width × cam_height` (set both to the
@@ -45,14 +48,21 @@ process slots allocated at the configured size (`test_capture_proc.py`); V4L2
 ```ini
 [embodiment.args]
 top_depth_serial = <D435 serial>
-capture_width = 1920
+capture_width = 1920            # colour stream
 capture_height = 1080
+depth_capture_width = 1280      # D435 depth tops out at 1280 x 720; aligned to colour
+depth_capture_height = 720
 cam_width = 1920
 cam_height = 1080
 ```
 
-D435 colour supports 1920 × 1080 at up to 30 fps; depth tops out at
-1280 × 720, and librealsense rejects a depth stream at 1920 × 1080. If the
-combined request fails at pipeline start, use `capture_width = 1280`,
-`capture_height = 720` (about 18 px per 20 mm tag at 1.2 m, marginal) or lower
-the camera.
+`depth_capture_width/height` (both or neither; default: same as the colour
+capture) set the depth stream separately, because a D435 cannot stream depth
+at 1920 × 1080 while its colour stream can. Depth is aligned to the colour
+frame in the reader, so the published depth array is always colour-sized.
+If a combination is rejected at pipeline start, fall back to 1280 × 720 for
+both (about 18 px per 20 mm tag at 1.2 m, marginal) or lower the camera.
+
+**Also changed after review:** the `yam-health` / `--watch` V4L2 probes use
+the configured capture size (previously fixed at 640 × 480), so the health
+check exercises the same stream mode as a run.

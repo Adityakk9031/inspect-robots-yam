@@ -194,6 +194,7 @@ def build(
     sleeps: list[float] | None = None,
     depth_fps: int = 30,
     capture_size: tuple[int, int] = (640, 480),
+    depth_capture_size: tuple[int, int] | None = None,
 ) -> tuple[_RealsenseCameraReader, FakeRs, FakeCv2, Clock, list[float]]:
     """Build a reader and all of its injected recording fakes."""
     rs = rs if rs is not None else FakeRs(pipelines, devices)
@@ -204,6 +205,7 @@ def build(
         serials or SERIALS,
         depth_fps,
         capture_size=capture_size,
+        depth_capture_size=depth_capture_size,
         rs_module=rs,
         cv2_module=cv2,
         sleep_fn=sleeps.append,
@@ -1226,5 +1228,18 @@ def test_inline_reader_requests_the_configured_capture_size() -> None:
 
     assert rs.configs[0].streams == [
         ("colour", 1280, 720, "rgb8", 30),
+        ("depth", 1280, 720, "z16", 30),
+    ]
+
+
+def test_inline_reader_can_run_depth_smaller_than_colour() -> None:
+    reader, rs, _, _, _ = build(
+        serials={"top_cam": "S1"}, capture_size=(1920, 1080), depth_capture_size=(1280, 720)
+    )
+
+    reader(cfg())
+
+    assert rs.configs[0].streams == [
+        ("colour", 1920, 1080, "rgb8", 30),
         ("depth", 1280, 720, "z16", 30),
     ]

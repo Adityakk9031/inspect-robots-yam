@@ -1364,3 +1364,27 @@ def test_human_format_shows_camera_skip_and_healthy_joint() -> None:
     assert "cameras" in text and "SKIPPED" in text
     assert "left_j0" in text and "OK" in text
     assert "montage: (not written)" in text
+
+
+def test_default_reader_factory_binds_the_configured_capture_size(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from inspect_robots_yam import health as health_module
+    from inspect_robots_yam.config import YamConfig
+
+    seen: list[tuple[int, int]] = []
+
+    class Recorder:
+        def __init__(self, devices: dict[str, str], *, capture_size: tuple[int, int]) -> None:
+            seen.append(capture_size)
+
+    monkeypatch.setattr(health_module.embodiment, "_OpenCVCameraReader", Recorder)
+    cfg = YamConfig(capture_width=1280, capture_height=720)
+    bound = health_module._reader_factory_for(cfg, health_module._default_reader_factory)
+    bound("top_cam", "/dev/video0")
+    assert seen == [(1280, 720)]
+
+    def injected(name: str, device: str) -> Any:
+        return object()
+
+    assert health_module._reader_factory_for(cfg, injected) is injected
