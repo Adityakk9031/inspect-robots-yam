@@ -549,6 +549,7 @@ def test_yam_rest_defaults() -> None:
     cfg = YamConfig()
     assert cfg.rest_pose == DEFAULT_REST_POSE
     assert cfg.rest_secs == 3.0
+    assert YamConfig(rest_pose=None).rest_pose is None
 
 
 def test_default_rest_pose_is_valid_for_default_limits() -> None:
@@ -810,3 +811,79 @@ def test_depth_capture_size_defaults_to_none_and_pairs() -> None:
         YamConfig(depth_capture_width=1280)
     with pytest.raises(ValueError, match="depth_capture_height must be an integer of at least 16"):
         YamConfig(depth_capture_width=1280, depth_capture_height=8)
+
+
+@pytest.mark.parametrize(
+    ("low", "high", "match"),
+    [
+        (
+            (float("nan"),) * 14,
+            _DEFAULT_HIGH,
+            "joint_low and joint_high must contain only finite values",
+        ),
+        (
+            _DEFAULT_LOW,
+            (float("inf"),) * 14,
+            "joint_low and joint_high must contain only finite values",
+        ),
+        (
+            (1.0,) * 14,
+            (0.0,) * 14,
+            "joint_low must not exceed joint_high in any dimension",
+        ),
+    ],
+)
+def test_joint_bounds_validation(
+    low: tuple[float, ...], high: tuple[float, ...], match: str
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        YamConfig(joint_low=low, joint_high=high)
+
+
+@pytest.mark.parametrize("pose_field", ["home_pose", "rest_pose"])
+def test_poses_must_contain_only_finite_values(pose_field: str) -> None:
+    bad_pose = (0.0,) * 13 + (float("nan"),)
+    with pytest.raises(ValueError, match=f"{pose_field} must contain only finite values"):
+        YamConfig(**{pose_field: bad_pose})
+
+
+@pytest.mark.parametrize("secs", [0.0, -1.0, float("nan"), float("inf")])
+def test_rest_secs_must_be_finite_and_positive(secs: float) -> None:
+    with pytest.raises(ValueError, match="rest_secs must be > 0"):
+        YamConfig(rest_secs=secs)
+
+
+@pytest.mark.parametrize(
+    ("open_val", "closed_val"),
+    [(float("nan"), 0.0), (1.0, float("nan")), (1.0, 1.0)],
+)
+def test_gripper_stroke_endpoints_validation(open_val: float, closed_val: float) -> None:
+    with pytest.raises(ValueError, match="gripper_open and gripper_closed must differ"):
+        YamConfig(gripper_open=open_val, gripper_closed=closed_val)
+
+
+@pytest.mark.parametrize("side", ["left", "right"])
+@pytest.mark.parametrize(
+    "bad_pos",
+    [(1.0, 2.0), (1.0, 2.0, float("nan")), (1.0, 2.0, 3.0, 4.0)],
+)
+def test_collision_base_pos_validation(side: str, bad_pos: tuple[float, ...]) -> None:
+    field = f"collision_{side}_base_pos"
+    with pytest.raises(ValueError, match=f"{field} must contain three finite coordinates when set"):
+        YamConfig(**{field: bad_pos})
+
+
+@pytest.mark.parametrize("side", ["left", "right"])
+@pytest.mark.parametrize("bad_yaw", [float("nan"), float("inf")])
+def test_collision_base_yaw_validation(side: str, bad_yaw: float) -> None:
+    field = f"collision_{side}_base_yaw"
+    with pytest.raises(ValueError, match=f"{field} must be finite when set"):
+        YamConfig(**{field: bad_yaw})
+
+
+@pytest.mark.parametrize("bad_thresh", [-1e-4, float("nan"), float("-inf")])
+def test_collision_penetration_threshold_validation(bad_thresh: float) -> None:
+    with pytest.raises(
+        ValueError, match="collision_penetration_threshold must be finite and >= 0 when set"
+    ):
+        YamConfig(collision_penetration_threshold=bad_thresh)
