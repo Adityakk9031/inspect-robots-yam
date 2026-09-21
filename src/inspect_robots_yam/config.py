@@ -480,19 +480,6 @@ class YamConfig(_FromKwargs):
                 raise ValueError("rest_pose must contain only finite values")
         if not np.isfinite(self.rest_secs) or self.rest_secs <= 0:
             raise ValueError("rest_secs must be > 0")
-        for name in ("collision_left_base_pos", "collision_right_base_pos"):
-            val = getattr(self, name)
-            if val is not None and (len(val) != 3 or not bool(np.all(np.isfinite(val)))):
-                raise ValueError(f"{name} must contain three finite coordinates when set")
-        for name in ("collision_left_base_yaw", "collision_right_base_yaw"):
-            val = getattr(self, name)
-            if val is not None and not np.isfinite(val):
-                raise ValueError(f"{name} must be finite when set")
-        if self.collision_penetration_threshold is not None and (
-            not np.isfinite(self.collision_penetration_threshold)
-            or self.collision_penetration_threshold < 0
-        ):
-            raise ValueError("collision_penetration_threshold must be finite and >= 0 when set")
         if self.max_steps_hint is not None and self.max_steps_hint < 1:
             raise ValueError("max_steps_hint must be >= 1")
         for key in ("capture_width", "capture_height"):
