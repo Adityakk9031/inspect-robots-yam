@@ -815,10 +815,9 @@ def test_depth_capture_size_defaults_to_none_and_pairs() -> None:
 def test_collision_hold_limit_default_and_validation() -> None:
     assert YamConfig().collision_hold_limit == 50
     assert YamConfig(collision_hold_limit=None).collision_hold_limit is None
-    assert YamConfig(collision_hold_limit=0).collision_hold_limit == 0
     assert YamConfig(collision_hold_limit=100).collision_hold_limit == 100
 
-    msg = "collision_hold_limit must be a non-negative integer or None"
-    for invalid in (-1, -50, "50", 50.0, True):
+    msg = "collision_hold_limit must be a positive integer or None"
+    for invalid in (-1, -50, 0, "50", 50.0, True):
         with pytest.raises(ValueError, match=msg):
             YamConfig(collision_hold_limit=invalid)  # type: ignore[arg-type]

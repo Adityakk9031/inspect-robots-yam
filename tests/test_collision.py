@@ -114,6 +114,7 @@ def test_lazy_loader_has_guided_install_error(monkeypatch: pytest.MonkeyPatch) -
         ({"sweep_resolution": np.nan}, "sweep_resolution"),
         ({"gripper_qpos": "command"}, "not supported"),
         ({"hold_limit": -1}, "hold_limit"),
+        ({"hold_limit": 0}, "hold_limit"),
         ({"hold_limit": "50"}, "hold_limit"),
     ],
 )
@@ -353,6 +354,8 @@ def test_approver_rejects_bad_mode_start_shape_nonfinite_and_collision(
         CollisionApprover(checker, bad, action_space=joint_space)
     with pytest.raises(ValueError, match="hold_limit"):
         CollisionApprover(checker, HOME, action_space=joint_space, hold_limit=-1)
+    with pytest.raises(ValueError, match="hold_limit"):
+        CollisionApprover(checker, HOME, action_space=joint_space, hold_limit=0)
     with pytest.raises(
         ValueError,
         match=r"already in collision.*collision_guardrail=false.*collision_\* geometry",
@@ -505,18 +508,30 @@ def test_disabled_collision_hold_limit_allows_indefinite_holds(
     checker: CollisionChecker,
     joint_space: Box,
 ) -> None:
-    for limit in (None, 0):
-        approver = CollisionApprover(
-            checker,
-            HOME,
-            action_space=joint_space,
-            hold_limit=limit,
-        )
-        store: dict[str, Any] = {}
-        colliding = Action(REACH_DOWN)
-        for _ in range(10):
-            held = approver.review(colliding, store)
-            assert held.meta["collision_blocked"] is True
+    # Explicit hold_limit=None disables even when checker defaults to hold_limit=50
+    approver = CollisionApprover(
+        checker,
+        HOME,
+        action_space=joint_space,
+        hold_limit=None,
+    )
+    store: dict[str, Any] = {}
+    colliding = Action(REACH_DOWN)
+    for _ in range(60):
+        held = approver.review(colliding, store)
+        assert held.meta["collision_blocked"] is True
+
+    # Disabled at checker config level also allows indefinite holds
+    disabled_checker = CollisionChecker(CollisionConfig(hold_limit=None))
+    approver_inherited = CollisionApprover(
+        disabled_checker,
+        HOME,
+        action_space=joint_space,
+    )
+    store2: dict[str, Any] = {}
+    for _ in range(60):
+        held = approver_inherited.review(colliding, store2)
+        assert held.meta["collision_blocked"] is True
 
 
 def test_resolution_derived_substeps_clamp_at_one_and_sixty_four(

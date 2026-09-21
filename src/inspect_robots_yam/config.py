@@ -121,6 +121,16 @@ class _FromKwargs:
         return cls(**flat)
 
 
+def validate_hold_limit(value: object, name: str = "collision_hold_limit") -> None:
+    """Validate that a collision hold limit is a positive integer or None."""
+    if value is not None and (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or value <= 0
+    ):
+        raise ValueError(f"{name} must be a positive integer or None")
+
+
 @dataclass(frozen=True)
 class YamConfig(_FromKwargs):
     """Static configuration for a bimanual YAM embodiment."""
@@ -486,12 +496,7 @@ class YamConfig(_FromKwargs):
                 not isinstance(value, int) or isinstance(value, bool) or value < 16
             ):
                 raise ValueError(f"{key} must be an integer of at least 16 or unset")
-        if self.collision_hold_limit is not None and (
-            not isinstance(self.collision_hold_limit, int)
-            or isinstance(self.collision_hold_limit, bool)
-            or self.collision_hold_limit < 0
-        ):
-            raise ValueError("collision_hold_limit must be a non-negative integer or None")
+        validate_hold_limit(self.collision_hold_limit, "collision_hold_limit")
         valid_realsense_capture = {"inline", "process"}
         if self.realsense_capture not in valid_realsense_capture:
             raise ValueError(

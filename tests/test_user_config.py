@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -145,5 +144,5 @@ def test_yam_subclass_registered_under_another_name_is_accepted(
 def test_malformed_config_propagates_system_exit(tmp_path: Path) -> None:
     path = _write_config(tmp_path, "[defaults\nembodiment = yam_arms\n")
 
-    with pytest.raises(SystemExit, match=f"error in {re.escape(str(path))}"):
+    with pytest.raises(SystemExit, match=f"error in {path}"):
         load_yam_defaults(_env(tmp_path))

@@ -27,12 +27,17 @@ from inspect_robots.errors import SafetyAbort
 from inspect_robots.spaces import Box
 from inspect_robots.types import Action
 
-from inspect_robots_yam.config import DEFAULT_JOINT_HOME_POSE, YamConfig
+from inspect_robots_yam.config import (
+    DEFAULT_JOINT_HOME_POSE,
+    YamConfig,
+    validate_hold_limit,
+)
 from inspect_robots_yam.packing import ARM_DOF, DIM_LABELS, TOTAL_DIM, validate_dim
 
 Vec = npt.NDArray[np.float64]
 ViolationMode = Literal["hold", "abort"]
 
+_INHERIT = object()
 _INSTALL_COMMAND = 'pip install "inspect-robots-yam[collision]"'
 _LAST_SAFE_KEY = "yam_collision:last_safe"
 _BLOCKED_COUNT_KEY = "yam_collision:blocked_count"
@@ -101,12 +106,7 @@ class CollisionConfig:
                 "gripper_qpos='command' is not supported by collision guardrail v1; "
                 "only 'open' is available"
             )
-        if self.hold_limit is not None and (
-            not isinstance(self.hold_limit, int)
-            or isinstance(self.hold_limit, bool)
-            or self.hold_limit < 0
-        ):
-            raise ValueError("hold_limit must be a non-negative integer or None")
+        validate_hold_limit(self.hold_limit, "hold_limit")
 
 
 _DEFAULT_COLLISION_CONFIG = CollisionConfig()
@@ -269,18 +269,17 @@ class CollisionApprover:
         *,
         action_space: Box,
         on_violation: ViolationMode = "hold",
-        hold_limit: int | None = None,
+        hold_limit: int | None | object = _INHERIT,
     ) -> None:
         _validate_action_space(action_space)
         if on_violation not in ("hold", "abort"):
             raise ValueError("on_violation must be 'hold' or 'abort'")
-        effective_limit = hold_limit if hold_limit is not None else checker.config.hold_limit
-        if effective_limit is not None and (
-            not isinstance(effective_limit, int)
-            or isinstance(effective_limit, bool)
-            or effective_limit < 0
-        ):
-            raise ValueError("hold_limit must be a non-negative integer or None")
+        effective_limit: int | None
+        if hold_limit is _INHERIT:
+            effective_limit = checker.config.hold_limit
+        else:
+            effective_limit = hold_limit  # type: ignore[assignment]
+        validate_hold_limit(effective_limit, "hold_limit")
         self._checker = checker
         self._start_pose = validate_dim(start_pose, TOTAL_DIM).copy()
         if not bool(np.all(np.isfinite(self._start_pose))):
@@ -387,7 +386,7 @@ def _collision_approver(
         start_pose,
         action_space=action_space,
         on_violation=on_violation,
-        hold_limit=cfg.hold_limit,
+        hold_limit=None,
     )
 
 
