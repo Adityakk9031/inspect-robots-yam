@@ -339,6 +339,10 @@ class FakeDriver:
         """Never called by these tests."""
         raise AssertionError("not used")  # pragma: no cover - contract filler
 
+    def get_motor_temps(self) -> npt.NDArray[np.float64]:
+        """Never called by these tests."""
+        raise AssertionError("not used")  # pragma: no cover - contract filler
+
     def command_joint_pos(self, target: npt.NDArray[np.float64]) -> None:
         """Never called by these tests."""
         raise AssertionError("not used")  # pragma: no cover - contract filler
@@ -444,3 +448,17 @@ def test_a_thread_close_left_running_cannot_fault_a_healthy_camera() -> None:
 
     image = reader._latest(cv2, "top_cam", YamConfig())
     assert np.array_equal(np.unique(image), np.array([1], dtype=np.uint8))
+
+
+def test_capture_size_is_negotiated_with_v4l2() -> None:
+    cv2 = FakeCv2({device: FakeCapture() for device in DEVICES.values()})
+    reader = _OpenCVCameraReader(
+        DEVICES, capture_size=(1280, 720), cv2_module=cv2, sleep_fn=lambda s: None, clock=Clock()
+    )
+    _OPENED.append(reader)
+    reader(YamConfig(capture_width=1280, capture_height=720))
+
+    cap = cv2.caps["/dev/cam0"]
+    sets = [call for call in cap.calls if call[0] == "set"]
+    assert ("set", FakeCv2.CAP_PROP_FRAME_WIDTH, 1280) in sets
+    assert ("set", FakeCv2.CAP_PROP_FRAME_HEIGHT, 720) in sets

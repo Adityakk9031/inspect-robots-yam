@@ -11,6 +11,8 @@ from inspect_robots.spaces import CameraSpec
 from inspect_robots_yam.config import (
     _DEFAULT_HIGH,
     _DEFAULT_LOW,
+    _EEF_ORIENTATION_PITCH,
+    _EEF_ORIENTATION_ROLL,
     DEFAULT_CAMERAS,
     DEFAULT_EEF_HIGH,
     DEFAULT_EEF_HOME_POSE,
@@ -38,6 +40,18 @@ def test_yam_defaults() -> None:
     assert cfg.low[6] == 0.0 and cfg.high[6] == 1.0
     assert cfg.low[0] == pytest.approx(-np.pi)
     assert cfg.control_interface == "joints"
+
+
+def test_motor_temp_defaults() -> None:
+    cfg = YamConfig()
+    assert cfg.motor_temp_limit is None
+    assert cfg.motor_temp_warn_margin == 10.0
+
+
+def test_pose_config_defaults() -> None:
+    cfg = YamConfig()
+    assert cfg.start_pose is None
+    assert cfg.pose_dir == "poses"
 
 
 def test_molmo_defaults_and_url() -> None:
@@ -73,6 +87,74 @@ def test_yam_from_kwargs() -> None:
     cfg = YamConfig.from_kwargs(left_channel="canA", control_hz=25.0)
     assert cfg.left_channel == "canA"
     assert cfg.control_hz == 25.0
+
+
+def test_motor_temp_from_kwargs() -> None:
+    cfg = YamConfig.from_kwargs(motor_temp_limit=75.0, motor_temp_warn_margin=5.0)
+    assert cfg.motor_temp_limit == 75.0
+    assert cfg.motor_temp_warn_margin == 5.0
+
+
+@pytest.mark.parametrize("limit", [0.0, -1.0, np.nan, np.inf, -np.inf])
+def test_motor_temp_limit_validation(limit: float) -> None:
+    with pytest.raises(ValueError, match="motor_temp_limit must be finite and > 0"):
+        YamConfig(motor_temp_limit=limit)
+
+
+@pytest.mark.parametrize("margin", [-1.0, np.nan, np.inf, -np.inf])
+def test_motor_temp_warn_margin_validation(margin: float) -> None:
+    with pytest.raises(ValueError, match="motor_temp_warn_margin must be finite and >= 0"):
+        YamConfig(motor_temp_warn_margin=margin)
+
+
+def test_motor_temp_warn_margin_must_be_below_limit() -> None:
+    with pytest.raises(ValueError, match="motor_temp_warn_margin must be less"):
+        YamConfig(motor_temp_limit=10.0, motor_temp_warn_margin=10.0)
+
+
+def test_motor_temp_warn_margin_rejects_none_from_kwargs() -> None:
+    with pytest.raises(ValueError, match="motor_temp_warn_margin cannot be none"):
+        YamConfig.from_kwargs(motor_temp_warn_margin=None)
+
+
+def test_start_pose_and_home_pose_are_mutually_exclusive() -> None:
+    with pytest.raises(ValueError, match="start_pose and home_pose"):
+        YamConfig(start_pose="ready", home_pose=(0.0,) * 14)
+
+
+def test_start_pose_accepted_with_eef_control() -> None:
+    cfg = YamConfig(start_pose="ready", control_interface="eef_pos")
+    assert cfg.start_pose == "ready"
+
+
+@pytest.mark.parametrize("name", ["", "   ", ".hidden", "../evil", "x" * 65])
+def test_start_pose_rejects_invalid_names_with_rule(name: str) -> None:
+    with pytest.raises(ValueError, match=r"must match \^\[A-Za-z0-9\]"):
+        YamConfig(start_pose=name)
+
+
+@pytest.mark.parametrize("pose_dir", ["", "   "])
+def test_pose_dir_must_be_nonempty(pose_dir: str) -> None:
+    with pytest.raises(ValueError, match="pose_dir must be a non-empty string"):
+        YamConfig(pose_dir=pose_dir)
+
+
+@pytest.mark.parametrize("field", ["start_pose", "pose_dir"])
+def test_pose_strings_reject_scalar_coercion_with_config_hint(field: str) -> None:
+    with pytest.raises(ValueError, match=rf"{field}.*quote.*config.ini"):
+        YamConfig.from_kwargs(**{field: 42})
+
+
+def test_pose_fields_land_through_from_kwargs() -> None:
+    cfg = YamConfig.from_kwargs(start_pose="007", pose_dir="42")
+    assert cfg.start_pose == "007"
+    assert cfg.pose_dir == "42"
+
+
+@pytest.mark.parametrize("field", ["start_pose", "pose_dir"])
+def test_pose_strings_treat_none_as_unset(field: str) -> None:
+    cfg = YamConfig.from_kwargs(**{field: None})
+    assert getattr(cfg, field) == getattr(YamConfig(), field)
 
 
 def test_gripper_stroke_defaults_to_one_second_and_point_one_step() -> None:
@@ -132,20 +214,35 @@ def test_yam_control_interface_validation() -> None:
 @pytest.mark.parametrize(
     ("kwargs", "message"),
     [
-        ({"eef_low": (0.0,) * 9}, "eef_low must have 10"),
-        ({"eef_high": (1.0,) * 9}, "eef_high must have 10"),
+        ({"eef_low": (0.0,) * 13}, "eef_low must have 14"),
+        ({"eef_high": (1.0,) * 13}, "eef_high must have 14"),
         (
             {"eef_high": (*DEFAULT_EEF_HIGH[:2], np.nan, *DEFAULT_EEF_HIGH[3:])},
             "only finite values",
         ),
-        ({"eef_low": DEFAULT_EEF_HIGH}, "eef_low must be below eef_high"),
         (
-            {"eef_low": (*DEFAULT_EEF_LOW[:3], -np.pi - 0.01, *DEFAULT_EEF_LOW[4:])},
-            "yaw bounds must stay within",
+            {"eef_low": (0.5, *DEFAULT_EEF_LOW[1:])},
+            "eef_low must not exceed eef_high",
         ),
         (
-            {"eef_high": (*DEFAULT_EEF_HIGH[:8], np.pi + 0.01, *DEFAULT_EEF_HIGH[9:])},
-            "yaw bounds must stay within",
+            {"eef_low": (*DEFAULT_EEF_LOW[:3], -np.pi - 0.01, *DEFAULT_EEF_LOW[4:])},
+            "yaw and roll bounds must stay within",
+        ),
+        (
+            {"eef_high": (*DEFAULT_EEF_HIGH[:10], np.pi + 0.01, *DEFAULT_EEF_HIGH[11:])},
+            "yaw and roll bounds must stay within",
+        ),
+        (
+            {"eef_high": (*DEFAULT_EEF_HIGH[:12], np.pi + 0.01, *DEFAULT_EEF_HIGH[13:])},
+            "yaw and roll bounds must stay within",
+        ),
+        (
+            {"eef_low": (*DEFAULT_EEF_LOW[:4], -np.pi / 2, *DEFAULT_EEF_LOW[5:])},
+            "pitch bounds must stay strictly inside",
+        ),
+        (
+            {"eef_high": (*DEFAULT_EEF_HIGH[:11], np.pi / 2, *DEFAULT_EEF_HIGH[12:])},
+            "pitch bounds must stay strictly inside",
         ),
         ({"ik_max_iters": 0}, "ik_max_iters must be a positive integer"),
         ({"ik_max_iters": 1.5}, "ik_max_iters must be a positive integer"),
@@ -203,8 +300,8 @@ def test_eef_config_defaults_and_cli_tuple_overrides() -> None:
         eef_low=",".join(str(value) for value in DEFAULT_EEF_LOW),
         eef_high=",".join(str(value) for value in DEFAULT_EEF_HIGH),
     )
-    assert cfg.eef_low_array.shape == (10,)
-    assert cfg.eef_high_array.shape == (10,)
+    assert cfg.eef_low_array.shape == (14,)
+    assert cfg.eef_high_array.shape == (14,)
     assert cfg.ik_max_iters == 20
     assert cfg.ik_step_joint_limit == pytest.approx(0.2)
     assert cfg.cmd_resync_threshold == pytest.approx(0.35)
@@ -237,7 +334,7 @@ def test_eef_action_space_shape_labels_bounds_and_semantics() -> None:
         high=np.asarray(DEFAULT_EEF_HIGH),
         control_interface="eef_pos",
     )
-    assert space.shape == (10,)
+    assert space.shape == (14,)
     assert space.low is not None and np.array_equal(space.low, DEFAULT_EEF_LOW)
     assert space.high is not None and np.array_equal(space.high, DEFAULT_EEF_HIGH)
     assert space.semantics.control_mode == "eef_abs_pose"
@@ -257,7 +354,7 @@ def test_absolute_action_spaces_declare_gripper_max_step_only_at_grippers() -> N
     eef_space = action_box(control_interface="eef_pos", gripper_max_step=0.25)
     assert eef_space.semantics is not None
     assert eef_space.semantics.max_step == tuple(
-        0.25 if index in (4, 9) else None for index in range(len(EEF_DIM_LABELS))
+        0.25 if index in (6, 13) else None for index in range(len(EEF_DIM_LABELS))
     )
 
 
@@ -288,12 +385,126 @@ def test_delta_and_unspecified_action_spaces_declare_no_max_step() -> None:
     assert unspecified_space.semantics.max_step is None
 
 
+def test_eef_pitch_and_roll_default_to_pinned_zero_bounds() -> None:
+    # Equality means a pinned axis: the default layout carries pitch/roll but
+    # they are not commandable until an operator widens their bounds.
+    cfg = YamConfig(control_interface="eef_pos")
+    for index in (4, 5, 11, 12):
+        assert cfg.eef_low_array[index] == cfg.eef_high_array[index] == 0.0
+    opened = YamConfig(
+        control_interface="eef_pos",
+        eef_high=(*DEFAULT_EEF_HIGH[:4], 0.8, 0.5, *DEFAULT_EEF_HIGH[6:]),
+        eef_low=(*DEFAULT_EEF_LOW[:4], -0.8, -0.5, *DEFAULT_EEF_LOW[6:]),
+    )
+    assert opened.eef_high_array[4] == pytest.approx(0.8)
+    assert opened.eef_low_array[5] == pytest.approx(-0.5)
+
+
+def test_eef_orientation_widened_ranges_match_the_run_warning_text() -> None:
+    # The contribute_guardrails widening notice promises "+/-0.6 / +/-pi/2"
+    # as a frozen string; pin the constants so the text cannot silently
+    # desync from the behavior.
+    assert _EEF_ORIENTATION_PITCH == (-0.6, 0.6)
+    assert (-np.pi / 2, np.pi / 2) == _EEF_ORIENTATION_ROLL
+
+
+def test_eef_orientation_widens_default_pitch_and_roll_only() -> None:
+    cfg = YamConfig(eef_orientation=True)
+
+    for index in (4, 11):
+        assert (cfg.eef_low[index], cfg.eef_high[index]) == pytest.approx(_EEF_ORIENTATION_PITCH)
+    for index in (5, 12):
+        assert (cfg.eef_low[index], cfg.eef_high[index]) == pytest.approx(_EEF_ORIENTATION_ROLL)
+    untouched = tuple(index for index in range(14) if index not in (4, 5, 11, 12))
+    assert tuple(cfg.eef_low[index] for index in untouched) == tuple(
+        DEFAULT_EEF_LOW[index] for index in untouched
+    )
+    assert tuple(cfg.eef_high[index] for index in untouched) == tuple(
+        DEFAULT_EEF_HIGH[index] for index in untouched
+    )
+
+
+def test_eef_orientation_widens_explicit_tuned_zero_pins() -> None:
+    low = list(DEFAULT_EEF_LOW)
+    high = list(DEFAULT_EEF_HIGH)
+    low[0], high[0] = 0.2, 0.4
+    low[8], high[8] = -0.1, 0.1
+
+    cfg = YamConfig(eef_low=tuple(low), eef_high=tuple(high), eef_orientation=True)
+
+    assert cfg.eef_low[0] == pytest.approx(0.2)
+    assert cfg.eef_high[8] == pytest.approx(0.1)
+    for index in (4, 11):
+        assert (cfg.eef_low[index], cfg.eef_high[index]) == pytest.approx(_EEF_ORIENTATION_PITCH)
+    for index in (5, 12):
+        assert (cfg.eef_low[index], cfg.eef_high[index]) == pytest.approx(_EEF_ORIENTATION_ROLL)
+
+
+def test_eef_orientation_preserves_nonzero_pins_and_open_bounds() -> None:
+    low = list(DEFAULT_EEF_LOW)
+    high = list(DEFAULT_EEF_HIGH)
+    low[4] = high[4] = 0.1
+    low[5], high[5] = -0.2, 0.3
+
+    cfg = YamConfig(eef_low=tuple(low), eef_high=tuple(high), eef_orientation=True)
+
+    assert cfg.eef_low[4] == cfg.eef_high[4] == pytest.approx(0.1)
+    assert (cfg.eef_low[5], cfg.eef_high[5]) == pytest.approx((-0.2, 0.3))
+    assert (cfg.eef_low[11], cfg.eef_high[11]) == pytest.approx(_EEF_ORIENTATION_PITCH)
+    assert (cfg.eef_low[12], cfg.eef_high[12]) == pytest.approx(_EEF_ORIENTATION_ROLL)
+
+
+def test_eef_orientation_off_preserves_shipped_bounds() -> None:
+    cfg = YamConfig()
+
+    assert cfg.eef_orientation is False
+    assert cfg.eef_low == DEFAULT_EEF_LOW
+    assert cfg.eef_high == DEFAULT_EEF_HIGH
+
+
+def test_eef_orientation_from_kwargs_widens_and_rejects_non_bools() -> None:
+    cfg = YamConfig.from_kwargs(eef_orientation=True)
+    assert (cfg.eef_low[4], cfg.eef_high[4]) == pytest.approx(_EEF_ORIENTATION_PITCH)
+
+    for value in (None, "true", "false", "off", 1):
+        with pytest.raises(ValueError, match="eef_orientation must be true or false"):
+            YamConfig.from_kwargs(eef_orientation=value)
+
+
+def test_eef_orientation_direct_construction_rejects_non_bool_after_length_checks() -> None:
+    with pytest.raises(ValueError, match="eef_orientation must be true or false"):
+        YamConfig(eef_orientation="true")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="eef_low must have 14 entries"):
+        YamConfig(eef_low=(0.0,) * 13, eef_orientation="true")  # type: ignore[arg-type]
+
+
+def test_pinned_orientation_labels_names_orientation_axes_in_layout_order() -> None:
+    assert YamConfig().pinned_orientation_labels() == (
+        "left_pitch",
+        "left_roll",
+        "right_pitch",
+        "right_roll",
+    )
+    assert YamConfig(eef_orientation=True).pinned_orientation_labels() == ()
+
+    low = list(DEFAULT_EEF_LOW)
+    high = list(DEFAULT_EEF_HIGH)
+    low[3] = high[3] = 0.2
+    assert YamConfig(eef_low=tuple(low), eef_high=tuple(high)).pinned_orientation_labels() == (
+        "left_yaw",
+        "left_pitch",
+        "left_roll",
+        "right_pitch",
+        "right_roll",
+    )
+
+
 def test_eef_observation_space_declares_joint_and_eef_state_once() -> None:
     space = observation_space(224, 224, DEFAULT_CAMERAS, control_interface="eef_pos")
     assert space.state_keys == frozenset({"joint_pos", "eef_state"})
     assert space.state is not None
     fields = {field.key: field.shape for field in space.state.fields}
-    assert fields == {"joint_pos": (14,), "eef_state": (10,)}
+    assert fields == {"joint_pos": (14,), "eef_state": (14,)}
 
 
 def test_yam_operational_defaults() -> None:
@@ -510,6 +721,17 @@ def test_report_joint_eff_rejects_non_bool_values(value: object) -> None:
         YamConfig.from_kwargs(report_joint_eff=value)
 
 
+@pytest.mark.parametrize("value", [True, False])
+def test_park_before_grade_accepts_explicit_bool(value: bool) -> None:
+    assert YamConfig.from_kwargs(park_before_grade=value).park_before_grade is value
+
+
+@pytest.mark.parametrize("value", [None, "yes", 1])
+def test_park_before_grade_rejects_non_bool_values(value: object) -> None:
+    with pytest.raises(ValueError, match="park_before_grade must be true or false"):
+        YamConfig.from_kwargs(park_before_grade=value)
+
+
 def test_collision_guardrail_defaults_on_and_binds_via_kwargs() -> None:
     assert YamConfig().collision_guardrail is True
     assert YamConfig.from_kwargs(collision_guardrail=False).collision_guardrail is False
@@ -563,3 +785,28 @@ def test_collision_bool_flags_reject_non_bool_values(flag: str, value: object) -
 def test_default_collision_flag_does_not_reject_unsupported_contribution_modes() -> None:
     assert YamConfig(control_interface="eef_pos").collision_guardrail is True
     assert YamConfig(joints_are_delta=True).collision_guardrail is True
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("capture_width", 8), ("capture_height", 0), ("capture_width", True), ("capture_height", 4.0)],
+)
+def test_capture_size_must_be_a_reasonable_integer(field: str, value: object) -> None:
+    with pytest.raises(ValueError, match=f"{field} must be an integer of at least 16"):
+        YamConfig(**{field: value})  # type: ignore[arg-type]
+
+
+def test_capture_size_defaults_match_the_historical_640x480() -> None:
+    cfg = YamConfig()
+    assert (cfg.capture_width, cfg.capture_height) == (640, 480)
+    assert YamConfig(capture_width=1920, capture_height=1080).capture_width == 1920
+
+
+def test_depth_capture_size_defaults_to_none_and_pairs() -> None:
+    assert YamConfig().depth_capture_size is None
+    cfg = YamConfig(depth_capture_width=1280, depth_capture_height=720)
+    assert cfg.depth_capture_size == (1280, 720)
+    with pytest.raises(ValueError, match="must be set together"):
+        YamConfig(depth_capture_width=1280)
+    with pytest.raises(ValueError, match="depth_capture_height must be an integer of at least 16"):
+        YamConfig(depth_capture_width=1280, depth_capture_height=8)

@@ -27,6 +27,7 @@ from inspect_robots.spaces import (
 )
 
 from inspect_robots_yam.packing import ARM_DOF, DIM_LABELS, STATE_KEY, TOTAL_DIM, state_spec
+from inspect_robots_yam.poses import validate_pose_name
 
 _T = TypeVar("_T", bound="_FromKwargs")
 
@@ -67,12 +68,23 @@ _STEP_ARM = (0.2,) * ARM_DOF + (1.0,)
 _DEFAULT_STEP_LIMITS = _STEP_ARM * 2
 
 EEF_DIM_LABELS: tuple[str, ...] = tuple(
-    f"{side}_{part}" for side in ("left", "right") for part in ("x", "y", "z", "yaw", "gripper")
+    f"{side}_{part}"
+    for side in ("left", "right")
+    for part in ("x", "y", "z", "yaw", "pitch", "roll", "gripper")
 )
-_EEF_ARM_LOW = (0.15, -0.25, 0.03, -np.pi, 0.0)
-_EEF_ARM_HIGH = (0.48, 0.25, 0.40, np.pi, 1.0)
+# Pitch and roll ship pinned at (0, 0): the axes exist in the layout but are
+# not commandable until an operator widens their bounds, which keeps default
+# behavior identical to the historical yaw-only interface.
+_EEF_ARM_LOW = (0.15, -0.25, 0.03, -np.pi, 0.0, 0.0, 0.0)
+_EEF_ARM_HIGH = (0.48, 0.25, 0.40, np.pi, 0.0, 0.0, 1.0)
 DEFAULT_EEF_LOW: tuple[float, ...] = _EEF_ARM_LOW * 2
 DEFAULT_EEF_HIGH: tuple[float, ...] = _EEF_ARM_HIGH * 2
+_EEF_YAW_INDICES = (3, 10)
+_EEF_PITCH_INDICES = (4, 11)
+_EEF_ROLL_INDICES = (5, 12)
+_EEF_ORIENTATION_PITCH = (-0.6, 0.6)
+_EEF_ORIENTATION_ROLL = (-np.pi / 2, np.pi / 2)
+_EEF_GRIPPER_INDICES = (6, 13)
 
 # Provisional 2026-07-14 LINEAR_4310 solution for EEF position (0.30, 0, 0.20),
 # jaw axis pitched 30 degrees from vertical toward the arm base, and open grippers.
@@ -134,6 +146,19 @@ class YamConfig(_FromKwargs):
     gripper_stroke_s: float = 1.0
     cam_height: int = 224
     cam_width: int = 224
+    # Native capture size requested from the camera before the resize to
+    # cam_width x cam_height. 640 x 480 is what every rig has used so far;
+    # raise it (e.g. 1920 x 1080) when a policy needs full-resolution frames,
+    # such as AprilTag detection of small tags. Applies to the RealSense paths
+    # (colour and depth streams; intrinsics scale from this size) and to the
+    # V4L2/OpenCV path (CAP_PROP_FRAME_WIDTH/HEIGHT).
+    capture_width: int = 640
+    capture_height: int = 480
+    # Optional separate size for the RealSense depth stream. None means "same
+    # as the colour capture". Depth is aligned to the colour frame, so a D435
+    # can run colour at 1920 x 1080 with depth at its 1280 x 720 maximum.
+    depth_capture_width: int | None = None
+    depth_capture_height: int | None = None
     joint_low: tuple[float, ...] = _DEFAULT_LOW
     joint_high: tuple[float, ...] = _DEFAULT_HIGH
     control_interface: str = "joints"
@@ -152,6 +177,13 @@ class YamConfig(_FromKwargs):
     # (DEFAULT_JOINT_HOME_POSE / DEFAULT_EEF_HOME_POSE).
     # Gripper slots are normalized 0-1 (1 = open).
     home_pose: tuple[float, ...] | None = None
+    # Named joint-space alternative to home_pose, resolved from pose_dir on the
+    # first reset of each connection. Works in both control interfaces; in
+    # eef_pos mode the resolved pose must also start inside the EEF action box
+    # (FK grasp-point position, gripper aperture, and relative yaw/pitch/roll
+    # 0 are all checked against eef_low/eef_high before the homing ramp).
+    start_pose: str | None = None
+    pose_dir: str = "poses"
     # Pose used to park on close() after reset() captures the initial pose. None
     # opts out of the factory target and parks at that captured pose instead.
     # Gripper slots are normalized 0-1 (1 = open).
@@ -185,6 +217,11 @@ class YamConfig(_FromKwargs):
     collision_table: bool = True
     collision_table_height: float | None = None
     collision_penetration_threshold: float | None = None
+    # Soft motor-temperature cutoff in degrees C. None disables both thermal
+    # gates; every arm and gripper slot uses the same conservative limit.
+    motor_temp_limit: float | None = None
+    # Warn once per trial this many degrees below the configured thermal limit.
+    motor_temp_warn_margin: float = 10.0
     # Wait for the arm to reach each commanded pose before observing, so a
     # chunked policy plans from a converged view. None disables the wait; a
     # tolerance must exceed the rig's steady-state offset (run
@@ -235,10 +272,31 @@ class YamConfig(_FromKwargs):
     # Opt-in raw estimated torque state. Kept off by default because adding a
     # runtime observation key changes the policy-facing contract.
     report_joint_eff: bool = False
+    # Parking before grading gives the grader an unobstructed final view, but it
+    # moves the arms. Rigs running tasks whose success state is the gripper
+    # holding an object must set this false; the framework then grades the last
+    # step's frames as before.
+    park_before_grade: bool = True
+    # Open default-pinned pitch/roll axes to conservative ranges. With this
+    # true, a 0,0 pitch/roll pin is widened; re-pin by setting this false or
+    # pinning at a nonzero epsilon.
+    eef_orientation: bool = False
 
     @classmethod
     def from_kwargs(cls, **flat: Any) -> YamConfig:
         """Build CLI configuration while keeping boolean off-states explicit."""
+        for field in ("start_pose", "pose_dir"):
+            if field not in flat:
+                continue
+            # None means "unset" (e.g. -E start_pose=none), matching the
+            # depth-serial guard below, which also lets None through.
+            if flat[field] is None:
+                del flat[field]
+            elif not isinstance(flat[field], str):
+                raise ValueError(
+                    f"{field} must be a string; quote the value in config.ini — "
+                    "numeric values are int-coerced and may lose leading zeros"
+                )
         for slot in ("top", "left", "right"):
             field = f"{slot}_depth_serial"
             if isinstance(flat.get(field), int):
@@ -248,10 +306,17 @@ class YamConfig(_FromKwargs):
                 )
         # The CLI parses the literal `none` to Python None, which is falsy: an
         # unvalidated None here would silently flip a boolean off (opting out
-        # of a safety gate, removing the table plane, or dropping the effort
-        # report) instead of the "library default" that `none` means
+        # of a safety gate, removing the table plane, dropping the effort
+        # report, or suppressing the pre-grade park) instead of the "library
+        # default" that `none` means
         # everywhere else.
-        for flag in ("collision_guardrail", "collision_table", "report_joint_eff"):
+        for flag in (
+            "collision_guardrail",
+            "collision_table",
+            "report_joint_eff",
+            "park_before_grade",
+            "eef_orientation",
+        ):
             if flag in flat and not isinstance(flat[flag], bool):
                 raise ValueError(f"{flag} must be true or false, got {flat[flag]!r}")
         if "collision_table_height" in flat and flat["collision_table_height"] is None:
@@ -259,12 +324,21 @@ class YamConfig(_FromKwargs):
                 "collision_table_height cannot be none; use collision_table=false "
                 "to remove the table"
             )
+        if "motor_temp_warn_margin" in flat and flat["motor_temp_warn_margin"] is None:
+            raise ValueError("motor_temp_warn_margin cannot be none; provide a non-negative value")
         if flat.get("collision_table") is False and flat.get("collision_table_height") is not None:
             raise ValueError(
                 "collision_table_height contradicts collision_table=false; remove the "
                 "height or set collision_table=true"
             )
         return super().from_kwargs(**flat)
+
+    @property
+    def depth_capture_size(self) -> tuple[int, int] | None:
+        """The RealSense depth stream size, or None to match the colour capture."""
+        if self.depth_capture_width is None or self.depth_capture_height is None:
+            return None
+        return (self.depth_capture_width, self.depth_capture_height)
 
     def __post_init__(self) -> None:
         """Reject values that violate the 14-D packing and hardware invariants.
@@ -280,6 +354,17 @@ class YamConfig(_FromKwargs):
             )
         if not np.isfinite(self.gripper_stroke_s) or self.gripper_stroke_s <= 0:
             raise ValueError("gripper_stroke_s must be finite and > 0")
+        if self.motor_temp_limit is not None and (
+            not np.isfinite(self.motor_temp_limit) or self.motor_temp_limit <= 0
+        ):
+            raise ValueError("motor_temp_limit must be finite and > 0 when set")
+        if not np.isfinite(self.motor_temp_warn_margin) or self.motor_temp_warn_margin < 0:
+            raise ValueError("motor_temp_warn_margin must be finite and >= 0")
+        if (
+            self.motor_temp_limit is not None
+            and self.motor_temp_warn_margin >= self.motor_temp_limit
+        ):
+            raise ValueError("motor_temp_warn_margin must be less than motor_temp_limit")
         valid_interfaces = {"eef_pos", "joints"}
         if self.control_interface not in valid_interfaces:
             raise ValueError(
@@ -296,15 +381,36 @@ class YamConfig(_FromKwargs):
         for name in ("eef_low", "eef_high"):
             if len(getattr(self, name)) != len(EEF_DIM_LABELS):
                 raise ValueError(f"{name} must have {len(EEF_DIM_LABELS)} entries")
+        if not isinstance(self.eef_orientation, bool):
+            raise ValueError(f"eef_orientation must be true or false, got {self.eef_orientation!r}")
+        if self.eef_orientation:
+            eef_low_values = list(self.eef_low)
+            eef_high_values = list(self.eef_high)
+            for index in _EEF_PITCH_INDICES:
+                if (eef_low_values[index], eef_high_values[index]) == (0.0, 0.0):
+                    eef_low_values[index], eef_high_values[index] = _EEF_ORIENTATION_PITCH
+            for index in _EEF_ROLL_INDICES:
+                if (eef_low_values[index], eef_high_values[index]) == (0.0, 0.0):
+                    eef_low_values[index], eef_high_values[index] = _EEF_ORIENTATION_ROLL
+            object.__setattr__(self, "eef_low", tuple(eef_low_values))
+            object.__setattr__(self, "eef_high", tuple(eef_high_values))
         eef_low = self.eef_low_array
         eef_high = self.eef_high_array
         if not np.all(np.isfinite(eef_low)) or not np.all(np.isfinite(eef_high)):
             raise ValueError("eef_low and eef_high must contain only finite values")
-        if np.any(eef_low >= eef_high):
-            raise ValueError("eef_low must be below eef_high in every dimension")
-        for yaw_index in (3, 8):
+        # Equality pins an axis (not commandable, action_box masks its
+        # max_step declaration); only an inverted pair is a config error.
+        if np.any(eef_low > eef_high):
+            raise ValueError("eef_low must not exceed eef_high in any dimension")
+        for yaw_index in (*_EEF_YAW_INDICES, *_EEF_ROLL_INDICES):
             if eef_low[yaw_index] < -np.pi or eef_high[yaw_index] > np.pi:
-                raise ValueError("eef yaw bounds must stay within [-pi, pi]")
+                raise ValueError("eef yaw and roll bounds must stay within [-pi, pi]")
+        # The relative-rotation ZYX extraction is singular at |pitch| = pi/2;
+        # keeping pitch bounds strictly inside guarantees every commandable
+        # orientation decomposes uniquely.
+        for pitch_index in _EEF_PITCH_INDICES:
+            if eef_low[pitch_index] <= -np.pi / 2 or eef_high[pitch_index] >= np.pi / 2:
+                raise ValueError("eef pitch bounds must stay strictly inside (-pi/2, pi/2)")
         if (
             not isinstance(self.ik_max_iters, int)
             or isinstance(self.ik_max_iters, bool)
@@ -351,12 +457,34 @@ class YamConfig(_FromKwargs):
             raise ValueError("settle_timeout_budget must be a positive integer")
         if self.home_pose is not None and len(self.home_pose) != TOTAL_DIM:
             raise ValueError(f"home_pose must have {TOTAL_DIM} entries")
+        if self.start_pose is not None and self.home_pose is not None:
+            raise ValueError("start_pose and home_pose are mutually exclusive; set only one key")
+        if self.start_pose is not None:
+            try:
+                validate_pose_name(self.start_pose)
+            except ValueError as exc:
+                raise ValueError(f"invalid start_pose: {exc}") from None
+        if not isinstance(self.pose_dir, str) or not self.pose_dir.strip():
+            raise ValueError("pose_dir must be a non-empty string")
         if self.rest_pose is not None and len(self.rest_pose) != TOTAL_DIM:
             raise ValueError(f"rest_pose must have {TOTAL_DIM} entries")
         if self.rest_secs <= 0:
             raise ValueError("rest_secs must be > 0")
         if self.max_steps_hint is not None and self.max_steps_hint < 1:
             raise ValueError("max_steps_hint must be >= 1")
+        for key in ("capture_width", "capture_height"):
+            value = getattr(self, key)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 16:
+                raise ValueError(f"{key} must be an integer of at least 16")
+        depth_pair = (self.depth_capture_width, self.depth_capture_height)
+        if (depth_pair[0] is None) != (depth_pair[1] is None):
+            raise ValueError("depth_capture_width and depth_capture_height must be set together")
+        for key in ("depth_capture_width", "depth_capture_height"):
+            value = getattr(self, key)
+            if value is not None and (
+                not isinstance(value, int) or isinstance(value, bool) or value < 16
+            ):
+                raise ValueError(f"{key} must be an integer of at least 16 or unset")
         valid_realsense_capture = {"inline", "process"}
         if self.realsense_capture not in valid_realsense_capture:
             raise ValueError(
@@ -504,6 +632,17 @@ class YamConfig(_FromKwargs):
         """Return Cartesian upper bounds in metres, radians, and gripper units."""
         return np.asarray(self.eef_high, dtype=np.float64)
 
+    def pinned_orientation_labels(self) -> tuple[str, ...]:
+        """Return EEF yaw, pitch, and roll labels whose bounds pin the axis."""
+        orientation_indices = frozenset(
+            (*_EEF_YAW_INDICES, *_EEF_PITCH_INDICES, *_EEF_ROLL_INDICES)
+        )
+        return tuple(
+            label
+            for index, label in enumerate(EEF_DIM_LABELS)
+            if index in orientation_indices and self.eef_low[index] == self.eef_high[index]
+        )
+
 
 @dataclass(frozen=True)
 class ActServerConfig(_FromKwargs):
@@ -574,7 +713,7 @@ def action_semantics(
     if control_interface == "eef_pos":
         max_step = (
             tuple(
-                gripper_max_step if index in (4, 9) else None
+                gripper_max_step if index in _EEF_GRIPPER_INDICES else None
                 for index in range(len(EEF_DIM_LABELS))
             )
             if gripper_max_step is not None
@@ -661,7 +800,7 @@ def observation_space(
 
     ``state_key`` drives *both* ``state_keys`` and the ``StateSpec`` field key so
     joint mode stays internally consistent for any configured key. Cartesian
-    mode additionally declares its 10-D ``eef_state`` reference.
+    mode additionally declares its 14-D ``eef_state`` reference.
     """
     state = state_spec(state_key)
     if control_interface == "eef_pos":

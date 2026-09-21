@@ -193,6 +193,8 @@ def build(
     clock: Clock | None = None,
     sleeps: list[float] | None = None,
     depth_fps: int = 30,
+    capture_size: tuple[int, int] = (640, 480),
+    depth_capture_size: tuple[int, int] | None = None,
 ) -> tuple[_RealsenseCameraReader, FakeRs, FakeCv2, Clock, list[float]]:
     """Build a reader and all of its injected recording fakes."""
     rs = rs if rs is not None else FakeRs(pipelines, devices)
@@ -202,6 +204,8 @@ def build(
     reader = _RealsenseCameraReader(
         serials or SERIALS,
         depth_fps,
+        capture_size=capture_size,
+        depth_capture_size=depth_capture_size,
         rs_module=rs,
         cv2_module=cv2,
         sleep_fn=sleeps.append,
@@ -889,6 +893,9 @@ def driver_factory(_config: YamConfig) -> Any:
         def get_joint_eff(self) -> np.ndarray:
             return np.zeros(14)
 
+        def get_motor_temps(self) -> np.ndarray:
+            return np.full(14, 30.0)
+
         def command_joint_pos(self, target: np.ndarray) -> None:
             del target
 
@@ -1198,3 +1205,41 @@ def test_close_depth_reader_release_error_is_swallowed() -> None:
             raise RuntimeError("release failed")
 
     embodiment(depth_reader=FailingDepthReader()).close()
+
+
+def test_intrinsics_scale_from_the_configured_capture_size() -> None:
+    reader, _, _, _, _ = build()
+
+    intrinsics = reader.extra(
+        YamConfig(cam_height=4, cam_width=4, capture_width=320, capture_height=240)
+    )["top_cam_intrinsics"]
+
+    expected = np.array(
+        [[600 * 4 / 320, 0, 320 * 4 / 320], [0, 600 * 4 / 240, 240 * 4 / 240], [0, 0, 1]],
+        dtype=np.float32,
+    )
+    assert np.array_equal(intrinsics, expected)
+
+
+def test_inline_reader_requests_the_configured_capture_size() -> None:
+    reader, rs, _, _, _ = build(serials={"top_cam": "S1"}, capture_size=(1280, 720))
+
+    reader(cfg())
+
+    assert rs.configs[0].streams == [
+        ("colour", 1280, 720, "rgb8", 30),
+        ("depth", 1280, 720, "z16", 30),
+    ]
+
+
+def test_inline_reader_can_run_depth_smaller_than_colour() -> None:
+    reader, rs, _, _, _ = build(
+        serials={"top_cam": "S1"}, capture_size=(1920, 1080), depth_capture_size=(1280, 720)
+    )
+
+    reader(cfg())
+
+    assert rs.configs[0].streams == [
+        ("colour", 1920, 1080, "rgb8", 30),
+        ("depth", 1280, 720, "z16", 30),
+    ]

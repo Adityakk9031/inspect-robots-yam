@@ -29,21 +29,21 @@ import logging
 import math
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from typing import Any, ClassVar, Protocol, runtime_checkable
 
 import numpy as np
 import numpy.typing as npt
 from inspect_robots.approver import GuardrailContribution
-from inspect_robots.conformance import DeviceSlot, OptionSlot
+from inspect_robots.conformance import DeviceSlot, NumberSlot, OptionSlot
 from inspect_robots.embodiment import SELF_PACED, EmbodimentInfo
 from inspect_robots.errors import ConfigError, EmbodimentFault
 from inspect_robots.scene import Scene
 from inspect_robots.spaces import Box
 from inspect_robots.types import OPERATOR_END, Action, Observation, StepResult
 
-from inspect_robots_yam import packing
+from inspect_robots_yam import packing, poses
 from inspect_robots_yam._capture_proc import (
     JOIN_TIMEOUT_S,
     MAX_FRAME_AGE_S,
@@ -62,6 +62,7 @@ from inspect_robots_yam._i2rt import (
 from inspect_robots_yam.config import (
     DEFAULT_CAMERAS,
     DEFAULT_EEF_HOME_POSE,
+    DEFAULT_EEF_LOW,
     DEFAULT_JOINT_HOME_POSE,
     EEF_DIM_LABELS,
     YamConfig,
@@ -120,6 +121,11 @@ up; how the two bases are mounted relative to each other depends on the rig.
 - left_yaw / right_yaw: tool rotation in radians about vertical, relative to
   the trial's start orientation; 0 keeps the start orientation and positive
   turns counterclockwise seen from above.
+- left_pitch / right_pitch, left_roll / right_roll: tool tilt in radians,
+  also relative to the trial's start orientation. Positive pitch tips the
+  tool forward (+x at yaw 0), positive roll toward the arm's left (+y at
+  yaw 0). An axis whose configured bounds are equal (typically 0) is pinned:
+  commands on it are clamped to that value and it cannot be actuated.
 - left_gripper / right_gripper: 0 is fully closed, 1 is fully open (about
   9.5 cm between the jaws).
 Proportions: upper arm 0.26 m, forearm 0.25 m, wrist to grasp point 0.25 m
@@ -167,7 +173,7 @@ class OperatorSessionLike(Protocol):
 
 @runtime_checkable
 class BimanualDriver(Protocol):
-    """The minimal 14-D joint-position and effort driver the embodiment needs."""
+    """The minimal 14-D joint-position, effort, and temperature driver contract."""
 
     def get_joint_pos(self) -> npt.NDArray[np.floating[Any]]:
         """Read both arm poses in radians and driver-native gripper units."""
@@ -175,6 +181,10 @@ class BimanualDriver(Protocol):
 
     def get_joint_eff(self) -> npt.NDArray[np.floating[Any]]:
         """Read packed arm and gripper estimated torque in raw N·m."""
+        ...
+
+    def get_motor_temps(self) -> npt.NDArray[np.floating[Any]]:
+        """Read packed max(MOS, rotor) temperatures in degrees C."""
         ...
 
     def command_joint_pos(self, target: npt.NDArray[np.floating[Any]]) -> None:
@@ -211,6 +221,13 @@ DriverFactory = Callable[[YamConfig], BimanualDriver]
 KinematicsFactory = Callable[[YamConfig], tuple[RawKinematics, RawKinematics]]
 CameraReader = Callable[[YamConfig], ImageMap]
 DepthReader = Callable[[YamConfig], dict[str, Any]]
+
+
+def ramp_waypoints(start: Vec, target: Vec, n: int) -> Iterator[Vec]:
+    """Yield ``n`` linear waypoints after ``start``, including ``target`` last."""
+    for index in range(1, n + 1):
+        alpha = index / n
+        yield (1.0 - alpha) * start + alpha * target
 
 
 class _RealsenseReader(Protocol):
@@ -288,6 +305,16 @@ def _default_driver_factory(cfg: YamConfig) -> BimanualDriver:  # pragma: no cov
             left_eff = np.append(left_obs["joint_eff"], left_obs["gripper_eff"])
             right_eff = np.append(right_obs["joint_eff"], right_obs["gripper_eff"])
             return packing.pack(left_eff, right_eff)
+
+        def get_motor_temps(self) -> npt.NDArray[np.floating[Any]]:
+            def _arm_temps(arm: Any) -> npt.NDArray[np.float64]:
+                states = arm.motor_chain.read_states()
+                return np.asarray(
+                    [max(state.temp_mos, state.temp_rotor) for state in states],
+                    dtype=np.float64,
+                )
+
+            return packing.pack(_arm_temps(left), _arm_temps(right))
 
         def command_joint_pos(self, target: npt.NDArray[np.floating[Any]]) -> None:
             lo, ro = packing.split(target)
@@ -409,7 +436,8 @@ class _OpenCVCameraReader:
     at one frame interval instead, independent of the control rate.
 
     cv2 is imported on the first frame read and devices open then too, so
-    construction stays inert. Negotiates YUYV at 640x480 explicitly (RealSense
+    construction stays inert. Negotiates YUYV at the configured capture size,
+    640x480 by default (RealSense
     D435s return empty frames on cv2 defaults) and resizes to ``cam_width`` x
     ``cam_height`` RGB.
 
@@ -428,11 +456,13 @@ class _OpenCVCameraReader:
     def __init__(
         self,
         devices: Mapping[str, str],
+        capture_size: tuple[int, int] = (REALSENSE_CAPTURE_WIDTH, REALSENSE_CAPTURE_HEIGHT),
         cv2_module: Any | None = None,
         sleep_fn: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._devices = dict(devices)
+        self._capture_size = capture_size
         self._cv2 = cv2_module
         self._sleep = sleep_fn
         self._clock = clock
@@ -540,8 +570,8 @@ class _OpenCVCameraReader:
             raise RuntimeError(f"cannot open {name} at {device}")
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter.fourcc(*"YUYV"))
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._capture_size[0])
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._capture_size[1])
         cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 3000)
         cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 1000)
         for _ in range(10):  # warm up: first frames can be empty
@@ -630,7 +660,7 @@ def _opencv_camera_reader(cfg: YamConfig) -> CameraReader:
         )
         if device is not None
     }
-    return _OpenCVCameraReader(devices)
+    return _OpenCVCameraReader(devices, capture_size=(cfg.capture_width, cfg.capture_height))
 
 
 def _default_camera_reader(cfg: YamConfig) -> ImageMap:
@@ -655,6 +685,8 @@ class _RealsenseCameraReader:
         self,
         serials: Mapping[str, str],
         depth_fps: int = 30,
+        capture_size: tuple[int, int] = (REALSENSE_CAPTURE_WIDTH, REALSENSE_CAPTURE_HEIGHT),
+        depth_capture_size: tuple[int, int] | None = None,
         rs_module: Any | None = None,
         cv2_module: Any | None = None,
         sleep_fn: Callable[[float], None] = time.sleep,
@@ -662,6 +694,8 @@ class _RealsenseCameraReader:
     ) -> None:
         self._serials = dict(serials)
         self._depth_fps = depth_fps
+        self._capture_size = capture_size
+        self._depth_capture_size = depth_capture_size
         self._rs = rs_module
         self._cv2 = cv2_module
         self._sleep = sleep_fn
@@ -693,18 +727,12 @@ class _RealsenseCameraReader:
         for name in self._serials:
             pair, generation = self._latest(name)
             intrinsics = pair.intrinsics.copy()
-            intrinsics[0, 0] = (
-                float(pair.intrinsics[0, 0]) * cfg.cam_width / REALSENSE_CAPTURE_WIDTH
-            )
-            intrinsics[0, 2] = (
-                float(pair.intrinsics[0, 2]) * cfg.cam_width / REALSENSE_CAPTURE_WIDTH
-            )
-            intrinsics[1, 1] = (
-                float(pair.intrinsics[1, 1]) * cfg.cam_height / REALSENSE_CAPTURE_HEIGHT
-            )
-            intrinsics[1, 2] = (
-                float(pair.intrinsics[1, 2]) * cfg.cam_height / REALSENSE_CAPTURE_HEIGHT
-            )
+            sx = cfg.cam_width / cfg.capture_width
+            sy = cfg.cam_height / cfg.capture_height
+            intrinsics[0, 0] = float(pair.intrinsics[0, 0]) * sx
+            intrinsics[0, 2] = float(pair.intrinsics[0, 2]) * sx
+            intrinsics[1, 1] = float(pair.intrinsics[1, 1]) * sy
+            intrinsics[1, 2] = float(pair.intrinsics[1, 2]) * sy
             extra[f"{name}_intrinsics"] = intrinsics
             extra[f"{name}_depth"] = self._depth_thunk(
                 name, cfg.cam_width, cfg.cam_height, generation
@@ -837,20 +865,10 @@ class _RealsenseCameraReader:
         """
         rs_cfg = rs.config()
         rs_cfg.enable_device(serial)
-        rs_cfg.enable_stream(
-            rs.stream.color,
-            REALSENSE_CAPTURE_WIDTH,
-            REALSENSE_CAPTURE_HEIGHT,
-            rs.format.rgb8,
-            self._depth_fps,
-        )
-        rs_cfg.enable_stream(
-            rs.stream.depth,
-            REALSENSE_CAPTURE_WIDTH,
-            REALSENSE_CAPTURE_HEIGHT,
-            rs.format.z16,
-            self._depth_fps,
-        )
+        width, height = self._capture_size
+        depth_w, depth_h = self._depth_capture_size or self._capture_size
+        rs_cfg.enable_stream(rs.stream.color, width, height, rs.format.rgb8, self._depth_fps)
+        rs_cfg.enable_stream(rs.stream.depth, depth_w, depth_h, rs.format.z16, self._depth_fps)
         pipeline = rs.pipeline()
         profile = pipeline.start(rs_cfg)
         try:
@@ -961,6 +979,8 @@ class _ProcessRealsenseCameraReader:
         self,
         serials: Mapping[str, str],
         depth_fps: int = 30,
+        capture_size: tuple[int, int] = (REALSENSE_CAPTURE_WIDTH, REALSENSE_CAPTURE_HEIGHT),
+        depth_capture_size: tuple[int, int] | None = None,
         *,
         child_entry: Any = None,
         transport: _CaptureTransport | None = None,
@@ -975,6 +995,8 @@ class _ProcessRealsenseCameraReader:
             else _CaptureProcess(
                 self._serials,
                 depth_fps,
+                capture_size=capture_size,
+                depth_capture_size=depth_capture_size,
                 child_entry=child_entry,
             )
         )
@@ -1003,18 +1025,12 @@ class _ProcessRealsenseCameraReader:
         for name in self._serials:
             snapshot = self._latest(name)
             intrinsics = snapshot.intrinsics.copy()
-            intrinsics[0, 0] = (
-                float(snapshot.intrinsics[0, 0]) * cfg.cam_width / REALSENSE_CAPTURE_WIDTH
-            )
-            intrinsics[0, 2] = (
-                float(snapshot.intrinsics[0, 2]) * cfg.cam_width / REALSENSE_CAPTURE_WIDTH
-            )
-            intrinsics[1, 1] = (
-                float(snapshot.intrinsics[1, 1]) * cfg.cam_height / REALSENSE_CAPTURE_HEIGHT
-            )
-            intrinsics[1, 2] = (
-                float(snapshot.intrinsics[1, 2]) * cfg.cam_height / REALSENSE_CAPTURE_HEIGHT
-            )
+            sx = cfg.cam_width / cfg.capture_width
+            sy = cfg.cam_height / cfg.capture_height
+            intrinsics[0, 0] = float(snapshot.intrinsics[0, 0]) * sx
+            intrinsics[0, 2] = float(snapshot.intrinsics[0, 2]) * sx
+            intrinsics[1, 1] = float(snapshot.intrinsics[1, 1]) * sy
+            intrinsics[1, 2] = float(snapshot.intrinsics[1, 2]) * sy
             extra[f"{name}_intrinsics"] = intrinsics
             extra[f"{name}_depth"] = self._depth_thunk(
                 name,
@@ -1141,8 +1157,8 @@ class YAMEmbodiment:
         DeviceSlot(arg="right_cam_device", kind="v4l2", label="right camera", group="cameras"),
     )
 
-    # The setup wizard offers these as yes/no questions (core OPTION_SLOTS
-    # protocol, inspect-robots#222) and writes the answers to config.ini.
+    # The setup wizard offers OPTION_SLOTS as yes/no questions and NUMBER_SLOTS
+    # as numeric questions, then writes the answers to config.ini.
     # The behavior contract lives on the matching YamConfig field. The wizard
     # suggestion may diverge from the YamConfig default in either direction:
     # auto_start stays conservative at runtime but the wizard nudges toward
@@ -1152,6 +1168,11 @@ class YAMEmbodiment:
     # can false-positive hold until max_steps (#109). An existing config's
     # stored value replaces the suggestion on re-runs. Joint effort reporting
     # is opt-in in both places because it changes the observation contract.
+    # EEF orientation is also opt-in because opening tilt axes invalidates the
+    # fingertips-down z-floor assumption and requires rig-specific adjustment.
+    # motor_temp_limit stays off by default for backward compatibility, while
+    # the wizard suggests 70 to arm the guardrail on fresh setups; operators can
+    # answer none to retain the off behavior (#150).
     OPTION_SLOTS: ClassVar[tuple[OptionSlot, ...]] = (
         OptionSlot(
             arg="auto_start",
@@ -1168,6 +1189,23 @@ class YAMEmbodiment:
             arg="report_joint_eff",
             label="Report estimated joint effort in observations (report_joint_eff)",
             default=False,
+        ),
+        OptionSlot(
+            arg="eef_orientation",
+            label="Open EEF pitch/roll tilt axes (eef_orientation; eef_pos rigs only, "
+            "raise the eef_low z floor after)",
+            default=False,
+        ),
+    )
+
+    NUMBER_SLOTS: ClassVar[tuple[NumberSlot, ...]] = (
+        NumberSlot(
+            arg="motor_temp_limit",
+            label="Motor temperature soft limit in degrees C "
+            "(motor_temp_limit; none disables the thermal guardrail)",
+            default=70,
+            minimum=1,
+            allow_none=True,
         ),
     )
 
@@ -1227,11 +1265,17 @@ class YAMEmbodiment:
             if depth_serials:
                 if self._cfg.realsense_capture == "inline":
                     self._builtin_realsense_reader = _RealsenseCameraReader(
-                        depth_serials, self._cfg.depth_fps
+                        depth_serials,
+                        self._cfg.depth_fps,
+                        capture_size=(self._cfg.capture_width, self._cfg.capture_height),
+                        depth_capture_size=self._cfg.depth_capture_size,
                     )
                 else:
                     self._builtin_realsense_reader = _ProcessRealsenseCameraReader(
-                        depth_serials, self._cfg.depth_fps
+                        depth_serials,
+                        self._cfg.depth_fps,
+                        capture_size=(self._cfg.capture_width, self._cfg.capture_height),
+                        depth_capture_size=self._cfg.depth_capture_size,
                     )
                 builtin_readers.append(self._builtin_realsense_reader)
             if len(builtin_readers) == 1:
@@ -1255,6 +1299,7 @@ class YAMEmbodiment:
         self._right_kinematics: _ArmKinematics | None = None
         self._eef_home_validated = False
         self._init_pose: Vec | None = None
+        self._resolved_start_pose: Vec | None = None
         # Set only after the stand-clear gate resolves (prompt returned, or
         # the auto_start notice printed), so a gate fault (dead stdin)
         # re-prompts on a retried reset instead of ramping unconfirmed;
@@ -1262,8 +1307,14 @@ class YAMEmbodiment:
         self._home_gate_confirmed = False
         self._instruction: str | None = None
         self._t_last = 0.0
+        # Wall-clock stamp taken when reset() hands the episode over, so the
+        # separately labeled wall time excludes homing while still exposing
+        # slow or overrunning policy steps.
+        self._t_started = 0.0
         self.num_steps = 0
         self.settle_timeouts = 0
+        self._motor_temp_warned = False
+        self._motor_temp_no_data_warned = False
         # Set when the per-trial timeout budget is exhausted; suppresses further
         # settling for the rest of the trial. Cleared at reset() entry.
         self._settle_disabled = False
@@ -1330,6 +1381,34 @@ class YAMEmbodiment:
 
     def contribute_guardrails(self, action_space: Box) -> GuardrailContribution:
         """Contribute collision holds when absolute joint checking is available."""
+        eef_warnings: tuple[str, ...] = ()
+        if self._cfg.control_interface == "eef_pos":
+            eef_warning_list = []
+            if self._cfg.eef_orientation:
+                eef_warning_list.append(
+                    "eef_orientation=true: pitch/roll bounds written as 0,0 are widened "
+                    "to +/-0.6 / +/-pi/2; set eef_orientation=false to re-pin"
+                )
+            pinned_labels = self._cfg.pinned_orientation_labels()
+            if pinned_labels:
+                eef_warning_list.append(
+                    f"eef_pos: action dims {', '.join(pinned_labels)} are pinned "
+                    "(low == high) and not commandable; widen eef_low/eef_high "
+                    "(eef_orientation=true opens only zero-pinned pitch/roll)"
+                )
+            for z_index, pitch_index, roll_index in ((2, 4, 5), (9, 11, 12)):
+                tilt_open = any(
+                    self._cfg.eef_low[index] != self._cfg.eef_high[index]
+                    for index in (pitch_index, roll_index)
+                )
+                if tilt_open and self._cfg.eef_low[z_index] <= DEFAULT_EEF_LOW[z_index]:
+                    eef_warning_list.append(
+                        "eef pitch/roll are open but eef_low z is at or below the "
+                        "fingertips-down default; knuckles or the wrist camera can reach "
+                        "the table first; raise the z floor"
+                    )
+                    break
+            eef_warnings = tuple(eef_warning_list)
         if not self._cfg.collision_guardrail:
             # Every other skip path warns; the wizard now suggests off for
             # unmeasured rigs (#109), so the opt-out must be visible in run
@@ -1338,11 +1417,15 @@ class YAMEmbodiment:
                 warnings=(
                     "collision guardrail disabled by config; set collision_guardrail=true "
                     "after measuring collision_*_base_pos",
+                    *eef_warnings,
                 )
             )
         if self._cfg.control_interface != "joints" or self._cfg.joints_are_delta:
             return GuardrailContribution(
-                warnings=("collision guardrail skipped: absolute joints mode only (plan 0011 v1)",)
+                warnings=(
+                    "collision guardrail skipped: absolute joints mode only (plan 0011 v1)",
+                    *eef_warnings,
+                )
             )
 
         from inspect_robots_yam.collision import _INSTALL_COMMAND, _collision_approver
@@ -1440,6 +1523,8 @@ class YAMEmbodiment:
         # captured from a possibly mid-motion pose, for every trial thereafter.
         self.settle_timeouts = 0
         self._settle_disabled = False
+        self._motor_temp_warned = False
+        self._motor_temp_no_data_warned = False
         # Ahead of the homing settle below, which names the scene if it has to
         # report a budget exhaustion; set later it would report the previous
         # trial's instruction, or None on the first.
@@ -1469,7 +1554,38 @@ class YAMEmbodiment:
                 "headless runs."
             )
         if self._driver is None:
+            if self._cfg.start_pose is not None and self._resolved_start_pose is None:
+                stored = poses.load_pose(self._cfg.pose_dir, self._cfg.start_pose)
+                resolved = np.asarray(stored.joints, dtype=np.float64)
+                bad = np.flatnonzero((resolved < self._cfg.low) | (resolved > self._cfg.high))
+                if bad.size:
+                    details = ", ".join(
+                        f"{int(index)}: {resolved[index]} vs "
+                        f"[{self._cfg.low[index]}, {self._cfg.high[index]}]"
+                        for index in bad
+                    )
+                    raise ValueError(
+                        f"start pose {stored.name!r} is outside configured joint bounds at "
+                        f"packed indices {bad.tolist()}: {details}"
+                    )
+                resolved.setflags(write=False)
+                self._resolved_start_pose = resolved
+                logger.info(
+                    "resolved start pose %r from %s",
+                    stored.name,
+                    poses.pose_path(self._cfg.pose_dir, stored.name),
+                )
             self._driver = self._driver_factory(self._cfg)
+        if self._cfg.motor_temp_limit is not None:
+            overheat = self._confirmed_overheat(self._cfg.motor_temp_limit)
+            if overheat is not None:
+                slot, temp = overheat
+                label, motor_id, channel = self._motor_identity(slot)
+                raise EmbodimentFault(
+                    f"thermal guardrail: {label} (motor id {motor_id}, {channel}) at "
+                    f"{temp:g} C >= limit {self._cfg.motor_temp_limit:g} C at episode "
+                    "start; let the rig cool or raise motor_temp_limit"
+                )
         if self._cfg.control_interface == "eef_pos" and (
             self._left_kinematics is None or self._right_kinematics is None
         ):
@@ -1510,7 +1626,10 @@ class YAMEmbodiment:
                 )
             self._home_gate_confirmed = True
         if not self._cfg.unattended:
-            self._status("homing: ramping arms to start pose")
+            if self._cfg.start_pose is None:
+                self._status("homing: ramping arms to start pose")
+            else:
+                self._status(f"homing: ramping arms to start pose {self._cfg.start_pose!r}")
         try:
             final_home_command = self._ramp_to(home_pose)
             # Inside the try, so the operator sees a status line instead of up
@@ -1556,7 +1675,7 @@ class YAMEmbodiment:
                     flush_first=self._deferred_operator_end,
                 )
             horizon = self._horizon_secs()
-            limit = f" Max {horizon:.0f}s." if horizon is not None else ""
+            limit = f" Max ~{horizon:.0f}s." if horizon is not None else ""
             if self._session is not None:
                 # Rig facts only: console prose (end gesture, message
                 # affordance) belongs to the connected session. This banner
@@ -1571,11 +1690,66 @@ class YAMEmbodiment:
                 self._status(f"Running: press any key to end the episode and grade it.{limit}")
         self.num_steps = 0
         self._t_last = self._clock()
+        self._t_started = self._t_last
         return self._observe(scene.instruction)
 
     def step(self, action: Action) -> StepResult:
         """Clamp + command one action, pace to the control rate, then maybe end."""
         driver = self._require_driver()
+        if self._cfg.motor_temp_limit is not None:
+            overheat = self._confirmed_overheat(self._cfg.motor_temp_limit)
+            if overheat is not None:
+                slot, temp = overheat
+                label, motor_id, channel = self._motor_identity(slot)
+                notice = (
+                    f"thermal guardrail: ending trial before motion; {label} "
+                    f"(motor id {motor_id}, {channel}) at {temp:g} C >= limit "
+                    f"{self._cfg.motor_temp_limit:g} C"
+                )
+                self._status(None)
+                if self._session is not None:
+                    self._session.write_line(notice)
+                else:
+                    self._operator.output_fn(notice)
+                logger.warning(notice)
+                try:
+                    observation = self._observe(self._instruction)
+                finally:
+                    # Park even when the observation capture raises: the one
+                    # thing known for certain here is that a motor is over its
+                    # limit, and a failed camera read must not leave the arm
+                    # hot-holding at the trip pose.
+                    target = (
+                        np.asarray(self._cfg.rest_pose, dtype=np.float64)
+                        if self._cfg.rest_pose is not None
+                        else self._init_pose
+                    )
+                    if target is not None:
+                        if not self._cfg.unattended:
+                            self._status("thermal guardrail: parking to rest to cool")
+                        try:
+                            sent = self._ramp_to(target)
+                            self._settle(sent)
+                        finally:
+                            if not self._cfg.unattended:
+                                self._status(None)
+                # The framework records the policy action even though this hot-path
+                # return deliberately does not execute it on the arm. The park
+                # settle is deliberately not reported: the trial is already over.
+                return StepResult(
+                    observation=observation,
+                    terminated=True,
+                    termination_reason="overheat",
+                    info={
+                        "overheat": {
+                            "slot": slot,
+                            "label": label,
+                            "motor_id": motor_id,
+                            "channel": channel,
+                            "temp": temp,
+                        }
+                    },
+                )
         self.num_steps += 1
         if self._cfg.control_interface == "eef_pos":
             cmd = packing.validate_dim(action.data, len(EEF_DIM_LABELS))
@@ -1589,7 +1763,9 @@ class YAMEmbodiment:
                 # units as absolute mode.
                 base = self._norm_grippers(packing.validate_dim(driver.get_joint_pos()))
                 cmd = base + cmd
-            target = self._send(cmd)
+                target = self._send(cmd, base=base)
+            else:
+                target = self._send(cmd)
         # Before _pace(), so a settle that finishes inside the control period
         # costs nothing: the pace simply sleeps out whatever is left.
         settle_info = self._settle_info(self._settle(target))
@@ -1612,6 +1788,45 @@ class YAMEmbodiment:
                 info=settle_info,
             )
         return StepResult(observation=obs, terminated=False, info=settle_info)
+
+    def observe_parked(self) -> Observation | None:
+        """Park and capture the final grader view for a scored trial.
+
+        The framework calls this immediately before grading. It moves the arms
+        to the configured rest pose, or the pose captured by :meth:`reset`, and
+        returns a fresh observation without lazy extras. It declines with
+        ``None`` when :attr:`YamConfig.park_before_grade` is false or the
+        driver is not connected (never connected, or already closed), leaving
+        no park target.
+        """
+        if not self._cfg.park_before_grade or self._driver is None or self._init_pose is None:
+            return None
+        target = (
+            np.asarray(self._cfg.rest_pose, dtype=np.float64)
+            if self._cfg.rest_pose is not None
+            else self._init_pose
+        )
+        # close() keeps its own ramp: a later close parks from wherever the arms
+        # are, and ramping twice to the same target is a no-op ramp. The status
+        # line stays open through the settle, like reset()'s ramp, so an
+        # attended operator is not left staring at silence for the settle wait.
+        if not self._cfg.unattended:
+            self._status("parking for grading: ramping arms clear")
+        try:
+            sent = self._ramp_to(target)
+            self._settle(sent)
+        finally:
+            if not self._cfg.unattended:
+                self._status(None)
+        observation = self._observe(None)
+        # image_times/state_time are deliberately left at their defaults: the
+        # source observation never sets them today, and a future _observe that
+        # does should extend this rebuild rather than lose them silently.
+        return Observation(
+            images=observation.images,
+            state=observation.state,
+            instruction=None,
+        )
 
     def close(self) -> None:
         """Park the arms, then release the driver handles.
@@ -1636,6 +1851,11 @@ class YAMEmbodiment:
         # abort between bind_task and the first reset) must not carry a stale
         # horizon into a later framework-less run.
         self._bound_max_steps = None
+        self._resolved_start_pose = None
+        # A reconnect re-reads a named start pose from its (possibly edited)
+        # file, so the EEF box validation must re-run with it. Revalidating a
+        # static home is idempotent.
+        self._eef_home_validated = False
         for kinematics in (self._left_kinematics, self._right_kinematics):
             if kinematics is not None:
                 kinematics.clear()
@@ -1707,15 +1927,15 @@ class YAMEmbodiment:
         start = self._norm_grippers(packing.validate_dim(driver.get_joint_pos()))
         hz = self._cfg.control_hz if self._cfg.control_hz > 0 else 10.0
         n_base = round(self._cfg.rest_secs * hz)
+        clamped_target = np.clip(target, self._cfg.low, self._cfg.high)
         steps_needed = max(
             math.ceil(abs(t - s) / limit)
-            for s, t, limit in zip(start, target, self._cfg.step_limits, strict=True)
+            for s, t, limit in zip(start, clamped_target, self._cfg.step_limits, strict=True)
         )
         n = max(1, n_base, steps_needed)
         sent = start
-        for i in range(1, n + 1):
-            alpha = i / n
-            sent = self._send((1.0 - alpha) * start + alpha * target, base=sent)
+        for waypoint in ramp_waypoints(start, target, n):
+            sent = self._send(waypoint, base=sent)
             self._sleep(1.0 / hz)
         return sent
 
@@ -1745,6 +1965,8 @@ class YAMEmbodiment:
 
     def _home_pose(self) -> Vec:
         """Select the configured joint home, defaulting per control interface."""
+        if self._resolved_start_pose is not None:
+            return self._resolved_start_pose
         if self._cfg.control_interface == "eef_pos":
             values = self._cfg.home_pose or DEFAULT_EEF_HOME_POSE
         else:
@@ -1799,29 +2021,36 @@ class YAMEmbodiment:
                 left_kinematics,
                 home[: packing.ARM_DOF],
                 float(home[packing.ARM_DOF]),
-                slice(0, 5),
+                slice(0, 7),
             ),
             (
                 "right",
                 right_kinematics,
                 home[packing.ARM_WIDTH : packing.ARM_WIDTH + packing.ARM_DOF],
                 float(home[-1]),
-                slice(5, 10),
+                slice(7, 14),
             ),
         )
         for side, kinematics, joints, gripper, bounds in arm_values:
             position = kinematics.fk(joints)[:3, 3]
-            home_state = np.asarray((*position, 0.0, gripper))
+            # Relative yaw/pitch/roll at arrival are 0 by construction: the
+            # home pose is the pose the orientation reference is captured from.
+            home_state = np.asarray((*position, 0.0, 0.0, 0.0, gripper))
             if np.any(home_state < self._cfg.eef_low_array[bounds]) or np.any(
                 home_state > self._cfg.eef_high_array[bounds]
             ):
+                source = (
+                    f"start pose {self._cfg.start_pose!r}"
+                    if self._cfg.start_pose is not None
+                    else "home"
+                )
                 raise ValueError(
-                    f"{side} EEF home state {home_state.tolist()} is outside the "
-                    "configured action workspace bounds"
+                    f"{side} EEF {source} state {home_state.tolist()} is outside "
+                    "the configured action workspace bounds"
                 )
 
     def _step_eef(self, action: Vec, driver: BimanualDriver) -> Vec:
-        """Convert one 10-D EEF action into the normative two-arm joint command.
+        """Convert one 14-D EEF action into the normative two-arm joint command.
 
         Returns the clamped vector actually sent, which is what settling waits
         for. In this mode that routinely differs from what the policy asked for:
@@ -1831,31 +2060,31 @@ class YAMEmbodiment:
         state = self._norm_grippers(packing.validate_dim(driver.get_joint_pos()))
         left_kinematics, right_kinematics = self._require_kinematics()
         left_command = left_kinematics.solve(
-            action[:4],
+            action[:6],
             state[: packing.ARM_DOF],
         )
         right_command = right_kinematics.solve(
-            action[5:9],
+            action[7:13],
             state[packing.ARM_WIDTH : packing.ARM_WIDTH + packing.ARM_DOF],
         )
         command = packing.pack(
-            np.concatenate((left_command, action[4:5])),
-            np.concatenate((right_command, action[9:10])),
+            np.concatenate((left_command, action[6:7])),
+            np.concatenate((right_command, action[13:14])),
         )
-        sent = self._send(command)
+        sent = self._send(command, base=state)
         left_kinematics.update_sent(sent[: packing.ARM_DOF])
         right_kinematics.update_sent(sent[packing.ARM_WIDTH : packing.ARM_WIDTH + packing.ARM_DOF])
         return sent
 
     def _horizon_secs(self) -> float | None:
-        """The episode horizon in seconds: the bound envelope, else the hint.
+        """The estimated episode horizon in seconds: bound envelope, else hint.
 
-        Dividing by our own ``control_hz`` is honest because this embodiment
-        is ``SELF_PACED`` — that rate is the one ``_pace()`` sleeps to.
-
-        With ``settle_tolerance`` set, ``control_hz`` becomes a floor on step
-        duration rather than the rate, so this is then a lower bound rather
-        than an estimate. Issue #64 tracks driving it from the wall clock.
+        Dividing the step budget by our own ``control_hz`` is the closest we
+        get: remaining step duration is not knowable in advance, so this is an
+        estimate and never a deadline. It is a lower bound whenever a step can
+        overrun the control period, which ``settle_tolerance`` makes routine
+        and a slow camera read can already cause. Callers render it with a
+        leading ``~`` to keep that visible to the operator.
         """
         steps = (
             self._bound_max_steps if self._bound_max_steps is not None else self._cfg.max_steps_hint
@@ -1866,10 +2095,12 @@ class YAMEmbodiment:
         return steps / hz
 
     def _emit_status(self) -> None:
-        """Once per second (of control time), tell the operator where they are.
+        """Roughly once per second, tell the operator where they are.
 
-        Elapsed time is counted in steps, so with ``settle_tolerance`` set both
-        this counter and the horizon it prints understate real time. Issue #64.
+        The counter tracks motion-budget consumption, so its units are
+        commensurate with the estimated horizon. Wall time is appended with an
+        explicit label because a step overrunning the control period must stay
+        visible to the operator.
         """
         if self._cfg.unattended:
             return
@@ -1877,9 +2108,14 @@ class YAMEmbodiment:
         interval = max(1, round(hz))
         if self.num_steps % interval != 0:
             return
-        elapsed = self.num_steps / hz
+        motion = self.num_steps / hz
+        wall = self._clock() - self._t_started
         horizon = self._horizon_secs()
-        span = f"{elapsed:.0f}s / {horizon:.0f}s" if horizon is not None else f"{elapsed:.0f}s"
+        span = (
+            f"{motion:.0f}s / ~{horizon:.0f}s | wall {wall:.0f}s"
+            if horizon is not None
+            else f"{motion:.0f}s | wall {wall:.0f}s"
+        )
         if self._session is not None:
             # The connected session appends the framework-owned end-gesture hint;
             # sending our own copy would just be stripped and re-appended.
@@ -1895,6 +2131,67 @@ class YAMEmbodiment:
         if self._driver is None:
             raise RuntimeError("step() called before reset() (or after close())")
         return self._driver
+
+    def _read_motor_temps(self) -> Vec:
+        """Read the opt-in packed thermal snapshot from an updated driver."""
+        driver = self._require_driver()
+        get_motor_temps = getattr(driver, "get_motor_temps", None)
+        if not callable(get_motor_temps):
+            raise RuntimeError(
+                "motor_temp_limit is set but the injected driver lacks get_motor_temps()"
+            )
+        temps = packing.validate_dim(get_motor_temps())
+        if not self._motor_temp_no_data_warned and not np.any(temps > 0):
+            logger.warning(
+                "thermal guardrail got no valid temperature data; all motor readings are <= 0"
+            )
+            self._motor_temp_no_data_warned = True
+        self._warn_motor_temps(temps)
+        return temps
+
+    def _warn_motor_temps(self, temps: Vec) -> None:
+        """Log the first per-trial reading inside the configured warning margin."""
+        limit = self._cfg.motor_temp_limit
+        if limit is None or self._motor_temp_warned:
+            return
+        candidates = np.flatnonzero(
+            (temps > 0) & (temps >= limit - self._cfg.motor_temp_warn_margin)
+        )
+        if not candidates.size:
+            return
+        slot = int(candidates[int(np.argmax(temps[candidates]))])
+        temp = float(temps[slot])
+        label, motor_id, channel = self._motor_identity(slot)
+        logger.warning(
+            "thermal guardrail warning: %s (motor id %d, %s) at %g C; limit %g C",
+            label,
+            motor_id,
+            channel,
+            temp,
+            limit,
+        )
+        self._motor_temp_warned = True
+
+    def _confirmed_overheat(self, limit: float) -> tuple[int, float] | None:
+        """Return the hottest twice-over-limit motor, ignoring one-frame glitches."""
+        first = self._read_motor_temps()
+        initially_hot = (first > 0) & (first >= limit)
+        if not np.any(initially_hot):
+            return None
+        hz = self._cfg.control_hz if self._cfg.control_hz > 0 else 10.0
+        self._sleep(1.0 / hz)
+        second = self._read_motor_temps()
+        confirmed = initially_hot & (second > 0) & (second >= limit)
+        slots = np.flatnonzero(confirmed)
+        if not slots.size:
+            return None
+        slot = int(slots[int(np.argmax(second[slots]))])
+        return slot, float(second[slot])
+
+    def _motor_identity(self, slot: int) -> tuple[str, int, str]:
+        """Map one packed slot to its label, CAN motor id, and arm channel."""
+        channel = self._cfg.left_channel if slot < packing.ARM_WIDTH else self._cfg.right_channel
+        return packing.DIM_LABELS[slot], slot % packing.ARM_WIDTH + 1, channel
 
     def _send(self, cmd: Vec, base: Vec | None = None) -> Vec:
         """Apply absolute joint limits and per-step delta limits before sending.
@@ -1920,11 +2217,9 @@ class YAMEmbodiment:
 
     def _denorm_grippers(self, cmd: Vec) -> Vec:
         """Map wire grippers (1 = open, 0 = closed) into driver-native units."""
-        out: Vec = cmd.copy()
-        span = self._cfg.gripper_open - self._cfg.gripper_closed
-        for idx in (packing.ARM_DOF, packing.ARM_WIDTH + packing.ARM_DOF):  # 6, 13
-            out[idx] = self._cfg.gripper_closed + cmd[idx] * span
-        return out
+        return packing.denorm_grippers(
+            cmd, gripper_open=self._cfg.gripper_open, gripper_closed=self._cfg.gripper_closed
+        )
 
     def _norm_grippers(self, physical: Vec) -> Vec:
         """Map driver units to wire grippers (1 = open, 0 = closed).
@@ -1932,11 +2227,11 @@ class YAMEmbodiment:
         ``YamConfig.__post_init__`` guarantees ``gripper_open != gripper_closed``,
         so the span is never zero.
         """
-        out: Vec = physical.copy()
-        span = self._cfg.gripper_open - self._cfg.gripper_closed
-        for idx in (packing.ARM_DOF, packing.ARM_WIDTH + packing.ARM_DOF):  # 6, 13
-            out[idx] = (physical[idx] - self._cfg.gripper_closed) / span
-        return out
+        return packing.norm_grippers(
+            physical,
+            gripper_open=self._cfg.gripper_open,
+            gripper_closed=self._cfg.gripper_closed,
+        )
 
     def _settle(self, target: Vec) -> tuple[bool, float] | None:
         """Wait for the arm joints to reach ``target``; report (settled, residual).

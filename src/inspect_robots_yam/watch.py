@@ -28,6 +28,7 @@ from inspect_robots_yam.health import (
     Image,
     ReaderFactory,
     _default_reader_factory,
+    _reader_factory_for,
 )
 
 FPS = 10
@@ -219,6 +220,7 @@ def serve(
     sleep_fn: Callable[[float], None] = time.sleep,
 ) -> int:
     """Bind first, then stream supervised cameras until interruption and close all handles."""
+    reader_factory = _reader_factory_for(cfg, reader_factory)
     try:
         server = server_factory((bind, port), _WatchRequestHandler)
     except OSError as exc:

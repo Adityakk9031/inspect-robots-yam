@@ -59,8 +59,13 @@ because absolute joint conformance permits only one 14-D state field.
 
 ## Safety invariants (do not weaken)
 
-- `YAMEmbodiment.step()` **always clamps** to `YamConfig.joint_low/high` before
-  commanding, independent of any `Approver`. This is the last line of defense.
+- `YAMEmbodiment.step()` **always clamps** to `YamConfig.joint_low/high` and
+  per-step `YamConfig.step_limits` before commanding, independent of any `Approver`.
+  This is the last line of defense.
+- Thermal trips end trials with the non-definitive `"overheat"` reason so the
+  park-for-grading ramp and operator verdict remain reachable. The trip parks
+  to rest from inside `step()` before terminating, in every mode. Never make
+  that reason definitive.
 - The declared `control_mode` is `joint_pos` for absolute joint mode,
   `joint_delta` when `joints_are_delta=True`, and `eef_abs_pose` in EEF mode.
   Delta joint commands are converted to absolute *inside* `step()` before the
@@ -75,8 +80,10 @@ because absolute joint conformance permits only one 14-D state field.
   which stock yam never emits.
 - `control_hz` is the step rate only while `settle_tolerance` is `None`, which
   is the default. Setting it makes `step()` and `reset()` wait for the arm to
-  reach the commanded pose, so `control_hz` becomes a floor on step duration and
-  the step-count-derived operator displays understate real time (#64). Keep the
+  reach the commanded pose, so `control_hz` becomes a floor on step duration.
+  The operator's elapsed counter reads the wall clock and stays true through
+  that; the `Max ~...s` horizon divides the step budget by `control_hz` and is
+  therefore an estimate, printed with a tilde to say so (#64). Keep the
   default off: enabling it by default would change timing for every VLA, which
   are trained on a fixed cadence. See `plans/0009-settle-before-observe.md`, and
   #63 for why settling alone does not make the camera image postdate the motion.

@@ -6,6 +6,7 @@ import itertools
 import math
 import warnings
 from dataclasses import dataclass
+from pathlib import Path
 from typing import NoReturn, cast
 
 import numpy as np
@@ -16,7 +17,9 @@ from inspect_robots.scene import Scene
 from inspect_robots.types import Action
 
 import inspect_robots_yam.embodiment as embodiment_module
+from inspect_robots_yam import poses
 from inspect_robots_yam.config import (
+    DEFAULT_JOINT_HOME_POSE,
     DEFAULT_REST_POSE,
     YamConfig,
 )
@@ -29,9 +32,14 @@ class FakeDriver:
         self,
         state: np.ndarray | None = None,
         effort: np.ndarray | None = None,
+        temps: np.ndarray | None = None,
+        temps_seq: list[np.ndarray] | None = None,
     ) -> None:
         self.state = np.zeros(14) if state is None else state
         self.effort = np.zeros(14) if effort is None else effort
+        self.temps = np.full(14, 30.0) if temps is None else temps
+        self.temps_seq = list(temps_seq or [])
+        self.temp_reads = 0
         self.commands: list[np.ndarray] = []
         self.closed = False
 
@@ -40,6 +48,12 @@ class FakeDriver:
 
     def get_joint_eff(self) -> np.ndarray:
         return self.effort.copy()
+
+    def get_motor_temps(self) -> np.ndarray:
+        self.temp_reads += 1
+        if self.temps_seq:
+            return self.temps_seq.pop(0).copy()
+        return self.temps.copy()
 
     def command_joint_pos(self, target: np.ndarray) -> None:
         self.commands.append(np.asarray(target, dtype=float).copy())
@@ -112,6 +126,28 @@ class _RecordingSession:
             raise self._gate_error
 
 
+class _PacedClock:
+    """Fake clock that only moves when someone sleeps, plus optional overrun.
+
+    A frozen clock cannot tell a step-count counter apart from a wall-clock
+    one, which is how #64 stayed invisible. This advances on the paced sleep
+    the way real time does, and ``overrun`` adds time the pacing never
+    accounts for, standing in for a settle or a slow camera read.
+    """
+
+    def __init__(self, overrun: float = 0.0) -> None:
+        self.now = 0.0
+        self.overrun = overrun
+
+    def __call__(self) -> float:
+        """Read the current fake time."""
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        """Advance time by the slept interval, then by any configured overrun."""
+        self.now += seconds + self.overrun
+
+
 def _build(
     cfg: YamConfig | None = None,
     *,
@@ -170,6 +206,175 @@ def test_reset_returns_observation_and_homes() -> None:
     assert home_cmd[0] == pytest.approx(0.1)
     assert home_cmd[6] == pytest.approx(19.0)  # 20 + 0.1 * (10 - 20)
     assert home_cmd[13] == pytest.approx(19.0)
+
+
+def _save_start_pose(directory: Path, name: str, values: tuple[float, ...]) -> None:
+    poses.save_pose(
+        directory,
+        poses.StartPose(
+            name=name,
+            joints=values,
+            created_at="2026-08-19T12:00:00+00:00",
+        ),
+        overwrite=True,
+    )
+
+
+def test_named_start_pose_resolves_and_homing_ramps_to_it(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    target = (0.2,) * 6 + (0.4,) + (0.3,) * 6 + (0.6,)
+    _save_start_pose(tmp_path, "ready", target)
+    cfg = YamConfig(start_pose="ready", pose_dir=str(tmp_path), rest_secs=0.2)
+    driver = EchoDriver()
+    emb, _, _ = _build(cfg, driver=driver)
+
+    with caplog.at_level("INFO", logger="inspect_robots_yam.embodiment"):
+        emb.reset(Scene(id="s", instruction="x"))
+
+    assert len(driver.commands) == 2
+    assert driver.commands[-1] == pytest.approx(target)
+    assert "resolved start pose 'ready'" in caplog.text
+    assert str(tmp_path / "ready.json") in caplog.text
+
+
+def test_named_start_pose_resolution_fails_before_driver_factory(tmp_path: Path) -> None:
+    calls = 0
+
+    def factory(_cfg: YamConfig) -> FakeDriver:
+        nonlocal calls
+        calls += 1
+        return FakeDriver()
+
+    emb = YAMEmbodiment(
+        YamConfig(start_pose="missing", pose_dir=str(tmp_path)),
+        driver_factory=factory,
+        camera_reader=_cameras,
+        operator=_operator(),
+        sleep_fn=lambda _delay: None,
+        clock=lambda: 0.0,
+    )
+    with pytest.raises(poses.PoseStoreError, match="available poses"):
+        emb.reset(Scene(id="s", instruction="x"))
+    assert calls == 0
+
+
+def test_named_start_pose_out_of_bounds_names_indices_before_connect(tmp_path: Path) -> None:
+    values = [0.0] * 14
+    values[0] = 4.0
+    values[8] = -4.0
+    _save_start_pose(tmp_path, "unsafe", tuple(values))
+    calls = 0
+
+    def factory(_cfg: YamConfig) -> FakeDriver:
+        nonlocal calls
+        calls += 1
+        return FakeDriver()
+
+    emb = YAMEmbodiment(
+        YamConfig(start_pose="unsafe", pose_dir=str(tmp_path)),
+        driver_factory=factory,
+        camera_reader=_cameras,
+        operator=_operator(),
+        sleep_fn=lambda _delay: None,
+        clock=lambda: 0.0,
+    )
+    with pytest.raises(ValueError, match=r"unsafe.*packed indices \[0, 8\].*4\.0"):
+        emb.reset(Scene(id="s", instruction="x"))
+    assert calls == 0
+
+
+def test_named_start_pose_is_cached_across_failed_factory_retry(tmp_path: Path) -> None:
+    old = (0.1,) * 14
+    new = (0.2,) * 14
+    _save_start_pose(tmp_path, "ready", old)
+    driver = EchoDriver()
+    calls = 0
+
+    def factory(_cfg: YamConfig) -> FakeDriver:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("connect fault")
+        return driver
+
+    emb = YAMEmbodiment(
+        YamConfig(
+            start_pose="ready",
+            pose_dir=str(tmp_path),
+            rest_secs=0.1,
+            cam_height=4,
+            cam_width=4,
+        ),
+        driver_factory=factory,
+        camera_reader=_cameras,
+        operator=_operator(),
+        sleep_fn=lambda _delay: None,
+        clock=lambda: 0.0,
+    )
+    with pytest.raises(RuntimeError, match="connect fault"):
+        emb.reset(Scene(id="s", instruction="x"))
+    _save_start_pose(tmp_path, "ready", new)
+    emb.reset(Scene(id="s", instruction="x"))
+    assert driver.commands[-1] == pytest.approx(old)
+
+
+def test_close_clears_named_pose_cache_even_without_connection(tmp_path: Path) -> None:
+    old = (0.1,) * 14
+    new = (0.2,) * 14
+    _save_start_pose(tmp_path, "ready", old)
+    driver = EchoDriver()
+    calls = 0
+
+    def factory(_cfg: YamConfig) -> FakeDriver:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("connect fault")
+        return driver
+
+    emb = YAMEmbodiment(
+        YamConfig(
+            start_pose="ready",
+            pose_dir=str(tmp_path),
+            rest_secs=0.1,
+            cam_height=4,
+            cam_width=4,
+        ),
+        driver_factory=factory,
+        camera_reader=_cameras,
+        operator=_operator(),
+        sleep_fn=lambda _delay: None,
+        clock=lambda: 0.0,
+    )
+    with pytest.raises(RuntimeError, match="connect fault"):
+        emb.reset(Scene(id="s", instruction="x"))
+    emb.close()
+    _save_start_pose(tmp_path, "ready", new)
+    emb.reset(Scene(id="s", instruction="x"))
+    assert driver.commands[-1] == pytest.approx(new)
+
+
+def test_named_start_pose_status_includes_name(tmp_path: Path) -> None:
+    _save_start_pose(tmp_path, "ready", (0.1,) * 14)
+    status: list[str | None] = []
+    emb = YAMEmbodiment(
+        YamConfig(
+            start_pose="ready",
+            pose_dir=str(tmp_path),
+            rest_secs=0.1,
+            cam_height=4,
+            cam_width=4,
+        ),
+        driver_factory=lambda _cfg: EchoDriver(),
+        camera_reader=_cameras,
+        operator=_operator(),
+        sleep_fn=lambda _delay: None,
+        clock=lambda: 0.0,
+        status_fn=status.append,
+    )
+    emb.reset(Scene(id="s", instruction="x"))
+    assert status[0] == "homing: ramping arms to start pose 'ready'"
 
 
 def test_joint_eff_is_absent_by_default() -> None:
@@ -236,6 +441,372 @@ def test_joint_eff_requires_updated_injected_driver() -> None:
         emb.reset(Scene(id="s", instruction="inspect"))
 
 
+def test_motor_temp_guardrail_default_off_never_reads_or_warns(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    emb, driver, _ = _build()
+
+    with caplog.at_level("WARNING", logger="inspect_robots_yam.embodiment"):
+        emb.reset(Scene(id="s", instruction="inspect"))
+        emb.step(Action(data=np.zeros(14)))
+
+    assert driver.temp_reads == 0
+    assert "thermal guardrail" not in caplog.text
+
+
+def test_motor_temp_trip_parks_even_when_observation_capture_fails() -> None:
+    temperatures = np.full(14, 30.0)
+    temperatures[2] = 80.0
+    driver = FakeDriver(temps_seq=[np.full(14, 30.0), temperatures, temperatures])
+    calls = {"n": 0}
+
+    def flaky_cameras(cfg):
+        calls["n"] += 1
+        if calls["n"] > 1:
+            raise RuntimeError("camera gone")
+        return _cameras(cfg)
+
+    import dataclasses
+
+    cfg = dataclasses.replace(
+        YamConfig(motor_temp_limit=80.0, rest_secs=0.1), cam_height=4, cam_width=4
+    )
+    emb = YAMEmbodiment(
+        cfg,
+        driver_factory=lambda _c: driver,
+        camera_reader=flaky_cameras,
+        operator=_operator(),
+        poll_end=lambda: False,
+        sleep_fn=lambda _s: None,
+        clock=lambda: 0.0,
+    )
+    emb.reset(Scene(id="s", instruction="inspect"))
+    command_count = len(driver.commands)
+
+    with pytest.raises(RuntimeError, match="camera gone"):
+        emb.step(Action(data=np.ones(14)))
+
+    assert len(driver.commands) > command_count
+    assert np.array_equal(driver.commands[-1], DEFAULT_REST_POSE)
+
+
+def test_motor_temp_mid_run_trip_uses_session_notice_skips_policy_motion_and_parks() -> None:
+    temperatures = np.full(14, 30.0)
+    temperatures[8] = 80.0
+    driver = FakeDriver(
+        temps_seq=[np.full(14, 30.0), temperatures, temperatures],
+    )
+    emb, _, _ = _build(YamConfig(motor_temp_limit=80.0), driver=driver)
+    session = _RecordingSession()
+    emb.connect_operator_session(session)
+    emb.reset(Scene(id="s", instruction="inspect"))
+    command_count = len(driver.commands)
+
+    result = emb.step(Action(data=np.ones(14)))
+
+    assert result.terminated
+    assert result.termination_reason == "overheat"
+    assert len(driver.commands) == command_count + 30
+    assert np.array_equal(driver.commands[-1], DEFAULT_REST_POSE)
+    assert result.info["overheat"] == {
+        "slot": 8,
+        "label": "right_j1",
+        "motor_id": 2,
+        "channel": "can1",
+        "temp": 80.0,
+    }
+    assert session.statuses[-1] is None
+    assert len(session.lines) == 1
+    assert all(text in session.lines[0] for text in ("right_j1", "motor id 2", "can1", "80"))
+
+
+def test_motor_temp_mid_run_trip_observes_then_parks_even_when_grading_park_off() -> None:
+    cold = np.full(14, 30.0)
+    hot = cold.copy()
+    hot[4] = 80.0
+    trip_pose = np.full(14, 0.4)
+    rest_pose = np.full(14, 0.6)
+    driver = EchoDriver(state=np.full(14, 0.1), temps_seq=[cold, hot, hot])
+    emb, _, _ = _build(
+        YamConfig(
+            motor_temp_limit=80.0,
+            park_before_grade=False,
+            rest_pose=tuple(rest_pose),
+            rest_secs=0.1,
+        ),
+        driver=driver,
+    )
+    session = _RecordingSession()
+    emb.connect_operator_session(session)
+    emb.reset(Scene(id="s", instruction="inspect"))
+    driver.state = trip_pose.copy()
+    command_count = len(driver.commands)
+
+    result = emb.step(Action(data=np.ones(14)))
+
+    assert result.terminated
+    assert result.termination_reason == "overheat"
+    assert len(driver.commands) == command_count + 1
+    assert driver.commands[-1] == pytest.approx(rest_pose)
+    assert result.observation.state["joint_pos"] == pytest.approx(trip_pose)
+    assert session.statuses[-2:] == [
+        "thermal guardrail: parking to rest to cool",
+        None,
+    ]
+
+
+def test_motor_temp_mid_run_trip_parks_to_captured_pose_without_rest_pose() -> None:
+    cold = np.full(14, 30.0)
+    hot = cold.copy()
+    hot[5] = 80.0
+    init_pose = np.full(14, 0.1)
+    trip_pose = np.full(14, 0.3)
+    driver = EchoDriver(state=init_pose.copy(), temps_seq=[cold, hot, hot])
+    emb, _, _ = _build(
+        YamConfig(motor_temp_limit=80.0, rest_pose=None, rest_secs=0.1),
+        driver=driver,
+    )
+    emb.reset(Scene(id="s", instruction="inspect"))
+    driver.state = trip_pose.copy()
+    command_count = len(driver.commands)
+
+    result = emb.step(Action(data=np.ones(14)))
+
+    assert result.terminated
+    assert len(driver.commands) == command_count + 1
+    assert driver.commands[-1] == pytest.approx(init_pose)
+    assert result.observation.state["joint_pos"] == pytest.approx(trip_pose)
+
+
+def test_motor_temp_mid_run_trip_without_park_target_skips_ramp() -> None:
+    hot = np.full(14, 30.0)
+    hot[6] = 80.0
+    driver = FakeDriver(temps=hot)
+    emb, _, _ = _build(
+        YamConfig(motor_temp_limit=80.0, rest_pose=None),
+        driver=driver,
+    )
+
+    with pytest.raises(EmbodimentFault, match="thermal guardrail"):
+        emb.reset(Scene(id="s", instruction="inspect"))
+    result = emb.step(Action(data=np.ones(14)))
+
+    assert result.terminated
+    assert result.termination_reason == "overheat"
+    assert driver.commands == []
+
+
+def test_motor_temp_mid_run_trip_uses_unconnected_operator_notice() -> None:
+    lines: list[str] = []
+    statuses: list[str | None] = []
+    temperatures = np.full(14, 30.0)
+    temperatures[0] = 81.0
+    driver = FakeDriver(temps_seq=[np.full(14, 30.0), temperatures, temperatures])
+    cfg = YamConfig(motor_temp_limit=80.0, cam_height=4, cam_width=4)
+    emb = YAMEmbodiment(
+        cfg,
+        driver_factory=lambda _cfg: driver,
+        camera_reader=_cameras,
+        operator=OperatorIO(input_fn=lambda _prompt: "", output_fn=lines.append),
+        poll_end=lambda: False,
+        sleep_fn=lambda _seconds: None,
+        clock=lambda: 0.0,
+        status_fn=statuses.append,
+    )
+    emb.reset(Scene(id="s", instruction="inspect"))
+
+    result = emb.step(Action(data=np.zeros(14)))
+
+    assert result.terminated
+    assert statuses[-1] is None
+    assert len(lines) == 1
+    assert all(text in lines[0] for text in ("left_j0", "motor id 1", "can0", "81"))
+
+
+def test_motor_temp_confirmation_rejects_glitch_and_uses_fallback_sleep() -> None:
+    hot = np.full(14, 30.0)
+    hot[3] = 80.0
+    driver = FakeDriver(temps_seq=[np.full(14, 30.0), hot, np.full(14, 30.0)])
+    emb, _, sleeps = _build(
+        YamConfig(motor_temp_limit=80.0, control_hz=0.0, rest_secs=0.1),
+        driver=driver,
+    )
+    emb.reset(Scene(id="s", instruction="inspect"))
+    sleeps.clear()
+    command_count = len(driver.commands)
+
+    result = emb.step(Action(data=np.zeros(14)))
+
+    assert not result.terminated
+    assert len(driver.commands) == command_count + 1
+    assert sleeps == [0.1]
+
+
+def test_motor_temp_nonpositive_sentinels_never_trip() -> None:
+    driver = FakeDriver(temps=np.full(14, -1.0))
+    emb, _, _ = _build(
+        YamConfig(motor_temp_limit=0.1, motor_temp_warn_margin=0.01),
+        driver=driver,
+    )
+
+    emb.reset(Scene(id="s", instruction="inspect"))
+    result = emb.step(Action(data=np.zeros(14)))
+
+    assert not result.terminated
+
+
+def test_motor_temp_no_data_warns_once_per_trial_and_resets(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    driver = FakeDriver(temps=np.full(14, 30.0))
+    emb, _, _ = _build(YamConfig(motor_temp_limit=80.0), driver=driver)
+    emb.reset(Scene(id="s", instruction="inspect"))
+    driver.temps[:] = -1.0
+
+    with caplog.at_level("WARNING", logger="inspect_robots_yam.embodiment"):
+        emb.step(Action(data=np.zeros(14)))
+        emb.step(Action(data=np.zeros(14)))
+        emb.reset(Scene(id="s2", instruction="inspect again"))
+
+    warnings = [
+        record
+        for record in caplog.records
+        if "thermal guardrail got no valid temperature data" in record.message
+    ]
+    assert len(warnings) == 2
+
+
+def test_motor_temp_right_gripper_slot_trips() -> None:
+    hot = np.full(14, 30.0)
+    hot[13] = 85.0
+    driver = FakeDriver(temps_seq=[np.full(14, 30.0), hot, hot])
+    emb, _, _ = _build(YamConfig(motor_temp_limit=80.0), driver=driver)
+    emb.reset(Scene(id="s", instruction="inspect"))
+
+    result = emb.step(Action(data=np.zeros(14)))
+
+    assert result.termination_reason == "overheat"
+    assert result.info["overheat"] == {
+        "slot": 13,
+        "label": "right_gripper",
+        "motor_id": 7,
+        "channel": "can1",
+        "temp": 85.0,
+    }
+
+
+def test_motor_temp_warns_once_per_trial_and_resets(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    driver = FakeDriver(temps=np.full(14, 30.0))
+    emb, _, _ = _build(YamConfig(motor_temp_limit=80.0), driver=driver)
+    emb.reset(Scene(id="s", instruction="inspect"))
+    driver.temps[4] = 72.0
+
+    with caplog.at_level("WARNING", logger="inspect_robots_yam.embodiment"):
+        emb.step(Action(data=np.zeros(14)))
+        emb.step(Action(data=np.zeros(14)))
+        emb.reset(Scene(id="s2", instruction="inspect again"))
+
+    warnings = [
+        record for record in caplog.records if "thermal guardrail warning" in record.message
+    ]
+    assert len(warnings) == 2
+    assert all("left_j4" in record.message for record in warnings)
+
+
+def test_motor_temp_reset_read_warns_inside_margin(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    temperatures = np.full(14, 30.0)
+    temperatures[7] = 75.0
+    emb, _, _ = _build(
+        YamConfig(motor_temp_limit=80.0),
+        driver=FakeDriver(temps=temperatures),
+    )
+
+    with caplog.at_level("WARNING", logger="inspect_robots_yam.embodiment"):
+        emb.reset(Scene(id="s", instruction="inspect"))
+
+    assert "thermal guardrail warning: right_j0" in caplog.text
+
+
+def test_motor_temp_pre_run_gate_faults_before_motion_and_close_does_not_ramp() -> None:
+    hot = np.full(14, 30.0)
+    hot[2] = 82.0
+    driver = FakeDriver(temps_seq=[hot, hot])
+    emb, _, sleeps = _build(YamConfig(motor_temp_limit=80.0), driver=driver)
+
+    with pytest.raises(EmbodimentFault, match="thermal guardrail") as caught:
+        emb.reset(Scene(id="s", instruction="inspect"))
+
+    message = str(caught.value)
+    assert all(text in message for text in ("left_j2", "motor id 3", "can0", "82"))
+    assert driver.commands == []
+    assert sleeps == [0.1]
+    emb.close()
+    assert driver.commands == []
+    assert driver.closed
+
+
+def test_motor_temp_pre_run_confirmation_rejects_glitch() -> None:
+    hot = np.full(14, 30.0)
+    hot[1] = 80.0
+    driver = FakeDriver(temps_seq=[hot, np.full(14, 30.0)])
+    emb, _, _ = _build(YamConfig(motor_temp_limit=80.0), driver=driver)
+
+    observation = emb.reset(Scene(id="s", instruction="inspect"))
+
+    assert observation.instruction == "inspect"
+    assert driver.commands
+
+
+def test_motor_temp_warm_second_reset_faults_and_close_still_ramps() -> None:
+    cold = np.full(14, 30.0)
+    hot = cold.copy()
+    hot[9] = 83.0
+    driver = FakeDriver(temps_seq=[cold, hot, hot])
+    emb, _, _ = _build(
+        YamConfig(motor_temp_limit=80.0, rest_secs=0.1),
+        driver=driver,
+    )
+    emb.reset(Scene(id="s", instruction="inspect"))
+    first_trial_commands = len(driver.commands)
+
+    with pytest.raises(EmbodimentFault, match="thermal guardrail"):
+        emb.reset(Scene(id="s2", instruction="inspect again"))
+
+    assert len(driver.commands) == first_trial_commands
+    emb.close()
+    assert len(driver.commands) > first_trial_commands
+    assert driver.closed
+
+
+def test_motor_temp_limit_requires_updated_injected_driver() -> None:
+    class LegacyDriver:
+        def get_joint_pos(self) -> np.ndarray:
+            return np.zeros(14)
+
+        def command_joint_pos(self, target: np.ndarray) -> None:
+            del target
+
+        def close(self) -> None:
+            pass
+
+    driver = LegacyDriver()
+    emb = YAMEmbodiment(
+        YamConfig(cam_height=4, cam_width=4, motor_temp_limit=80.0),
+        driver_factory=lambda _cfg: cast(BimanualDriver, driver),
+        camera_reader=_cameras,
+        operator=_operator(),
+        sleep_fn=lambda _seconds: None,
+        clock=lambda: 0.0,
+    )
+
+    with pytest.raises(RuntimeError, match=r"motor_temp_limit.*get_motor_temps"):
+        emb.reset(Scene(id="s", instruction="inspect"))
+
+
 def test_reset_without_home_pose_ramps_to_factory_joint_home() -> None:
     state = np.zeros(14)
     state[0] = 0.5
@@ -245,9 +816,7 @@ def test_reset_without_home_pose_ramps_to_factory_joint_home() -> None:
     emb.reset(Scene(id="s", instruction="x"))
     # When home_pose is None, reset ramps to DEFAULT_JOINT_HOME_POSE
     # (0.0 for joints, open for grippers).
-    expected = np.zeros(14)
-    expected[0] = 0.0
-    expected[[6, 13]] = 1.0  # normalized open gripper
+    expected = np.asarray(DEFAULT_JOINT_HOME_POSE, dtype=float)
     expected_physical = emb._denorm_grippers(expected)
     assert drv.commands[-1] == pytest.approx(expected_physical)
 
@@ -514,14 +1083,15 @@ def test_connect_operator_session_owns_status_and_episode_end() -> None:
     constructor_status: list[str | None] = []
     polls: list[bool] = []
     driver = FakeDriver()
+    clock = _PacedClock()
     emb = YAMEmbodiment(
         YamConfig(cam_height=4, cam_width=4, control_hz=1.0),
         driver_factory=lambda _cfg: driver,
         camera_reader=_cameras,
         operator=_operator(),
         poll_end=lambda: polls.append(True) or True,
-        sleep_fn=lambda _seconds: None,
-        clock=lambda: 0.0,
+        sleep_fn=clock.sleep,
+        clock=clock,
         status_fn=constructor_status.append,
     )
 
@@ -540,7 +1110,7 @@ def test_connect_operator_session_owns_status_and_episode_end() -> None:
         None,
         "Running.",
     ]
-    assert session.statuses[3] == "t = 1s"
+    assert session.statuses[3] == "t = 1s | wall 1s"
     assert session.statuses[4:] == [
         "parking: ramping arms back before torque-off",
         None,
@@ -883,6 +1453,201 @@ def test_default_camera_reader_not_implemented() -> None:
         _default_camera_reader(YamConfig())
 
 
+def test_observe_parked_disabled_skips_driver_camera_and_ramp() -> None:
+    class CountingDriver(EchoDriver):
+        def __init__(self) -> None:
+            super().__init__()
+            self.reads = 0
+
+        def get_joint_pos(self) -> np.ndarray:
+            self.reads += 1
+            return super().get_joint_pos()
+
+    camera_calls: list[bool] = []
+
+    def _recording_cameras(cfg: YamConfig):
+        camera_calls.append(True)
+        return _cameras(cfg)
+
+    driver = CountingDriver()
+    emb = YAMEmbodiment(
+        YamConfig(
+            cam_height=4,
+            cam_width=4,
+            park_before_grade=False,
+            rest_secs=0.1,
+        ),
+        driver_factory=lambda _cfg: driver,
+        camera_reader=_recording_cameras,
+        operator=_operator(),
+        poll_end=lambda: False,
+        sleep_fn=lambda _seconds: None,
+        clock=lambda: 0.0,
+    )
+    emb.reset(Scene(id="s", instruction="x"))
+    reads = driver.reads
+    commands = len(driver.commands)
+    camera_calls.clear()
+
+    assert emb.observe_parked() is None
+    assert driver.reads == reads
+    assert len(driver.commands) == commands
+    assert camera_calls == []
+
+
+def test_observe_parked_declines_before_connect_or_pose_capture() -> None:
+    emb, driver, _ = _build()
+    assert emb.observe_parked() is None
+    assert driver.commands == []
+
+    class CaptureFault(FakeDriver):
+        def __init__(self) -> None:
+            super().__init__()
+            self.reads = 0
+
+        def get_joint_pos(self) -> np.ndarray:
+            self.reads += 1
+            raise RuntimeError("encoder read fault")
+
+    faulty_driver = CaptureFault()
+    emb, _, _ = _build(driver=faulty_driver)
+    with pytest.raises(RuntimeError, match="encoder read fault"):
+        emb.reset(Scene(id="s", instruction="x"))
+    assert faulty_driver.reads == 1
+    assert emb.observe_parked() is None
+    assert faulty_driver.reads == 1
+
+
+def test_observe_parked_ramps_settles_observes_and_drops_extra() -> None:
+    events: list[str] = []
+
+    class RecordingDriver(EchoDriver):
+        def get_joint_pos(self) -> np.ndarray:
+            events.append("read")
+            return super().get_joint_pos()
+
+        def command_joint_pos(self, target: np.ndarray) -> None:
+            events.append("command")
+            super().command_joint_pos(target)
+
+    images = {
+        name: np.full((4, 4, 3), fill, dtype=np.uint8)
+        for name, fill in (("top_cam", 1), ("left_cam", 2), ("right_cam", 3))
+    }
+
+    def _recording_cameras(_cfg: YamConfig):
+        events.append("camera")
+        return images
+
+    produced_extra = {"lazy_depth": lambda: np.ones((4, 4), dtype=np.float32)}
+
+    def _recording_extra(_cfg: YamConfig):
+        events.append("extra")
+        return produced_extra
+
+    status: list[str | None] = []
+    driver = RecordingDriver(state=np.full(14, 0.2))
+    emb = YAMEmbodiment(
+        YamConfig(
+            cam_height=4,
+            cam_width=4,
+            home_pose=(0.4,) * 14,
+            rest_pose=(0.6,) * 14,
+            rest_secs=0.1,
+            settle_tolerance=0.01,
+            zero_gravity_mode=False,
+        ),
+        driver_factory=lambda _cfg: driver,
+        camera_reader=_recording_cameras,
+        depth_reader=_recording_extra,
+        operator=_operator(),
+        poll_end=lambda: False,
+        sleep_fn=lambda _seconds: None,
+        clock=lambda: 0.0,
+        status_fn=status.append,
+    )
+    emb.reset(Scene(id="s", instruction="policy instruction"))
+    events.clear()
+    driver.commands.clear()
+    status.clear()
+
+    observation = emb.observe_parked()
+
+    assert observation is not None
+    assert events == ["read", "command", "read", "read", "camera", "extra"]
+    assert len(driver.commands) == 1
+    assert driver.commands[0] == pytest.approx(np.full(14, 0.6))
+    assert observation.state["joint_pos"] == pytest.approx(np.full(14, 0.6))
+    assert all(observation.images[name] is image for name, image in images.items())
+    assert not observation.extra
+    assert observation.extra is not produced_extra
+    assert observation.instruction is None
+    assert status == ["parking for grading: ramping arms clear", None]
+
+
+def test_observe_parked_uses_captured_pose_and_is_silent_unattended() -> None:
+    init_pose = np.full(14, 0.2)
+    driver = EchoDriver(state=init_pose.copy())
+    status: list[str | None] = []
+    emb = YAMEmbodiment(
+        YamConfig(
+            cam_height=4,
+            cam_width=4,
+            rest_pose=None,
+            rest_secs=0.1,
+            unattended=True,
+        ),
+        driver_factory=lambda _cfg: driver,
+        camera_reader=_cameras,
+        operator=_operator(),
+        poll_end=lambda: False,
+        sleep_fn=lambda _seconds: None,
+        clock=lambda: 0.0,
+        status_fn=status.append,
+    )
+    emb.reset(Scene(id="s", instruction="x"))
+    emb.step(Action(data=np.full(14, 0.8)))
+    driver.commands.clear()
+
+    observation = emb.observe_parked()
+
+    assert observation is not None
+    assert driver.commands[-1] == pytest.approx(init_pose)
+    assert observation.state["joint_pos"] == pytest.approx(init_pose)
+    assert status == []
+
+
+def test_observe_parked_ramp_fault_propagates_and_closes_status() -> None:
+    class FaultyDriver(EchoDriver):
+        fail_commands = False
+
+        def command_joint_pos(self, target: np.ndarray) -> None:
+            if self.fail_commands:
+                raise RuntimeError("grading park fault")
+            super().command_joint_pos(target)
+
+    driver = FaultyDriver()
+    status: list[str | None] = []
+    emb = YAMEmbodiment(
+        YamConfig(cam_height=4, cam_width=4, rest_secs=0.1),
+        driver_factory=lambda _cfg: driver,
+        camera_reader=_cameras,
+        operator=_operator(),
+        poll_end=lambda: False,
+        sleep_fn=lambda _seconds: None,
+        clock=lambda: 0.0,
+        status_fn=status.append,
+    )
+    emb.reset(Scene(id="s", instruction="x"))
+    status.clear()
+    driver.fail_commands = True
+
+    with pytest.raises(RuntimeError, match="grading park fault"):
+        emb.observe_parked()
+
+    assert status == ["parking for grading: ramping arms clear", None]
+
+
 def test_close_ramps_to_rest_pose_then_releases() -> None:
     # Reset and close each issue 20 waypoints at 10 Hz.
     cfg = YamConfig(rest_pose=(0.5,) * 14, rest_secs=2.0)
@@ -1156,7 +1921,12 @@ def test_close_rest_pose_zero_hz_falls_back_to_10hz() -> None:
     assert len(drv.commands) == 20  # reset and close each use the 10 Hz fallback
 
 
-def _build_with_status(cfg: YamConfig | None = None, poll_end_seq: list[bool] | None = None):
+def _build_with_status(
+    cfg: YamConfig | None = None,
+    poll_end_seq: list[bool] | None = None,
+    *,
+    clock: _PacedClock | None = None,
+):
     import dataclasses
 
     cfg = cfg or YamConfig()
@@ -1164,14 +1934,15 @@ def _build_with_status(cfg: YamConfig | None = None, poll_end_seq: list[bool] | 
     drv = FakeDriver()
     polls = list(poll_end_seq or [False])
     status: list[str | None] = []
+    clock = clock or _PacedClock()
     emb = YAMEmbodiment(
         cfg,
         driver_factory=lambda _c: drv,
         camera_reader=_cameras,
         operator=_operator(),
         poll_end=lambda: polls.pop(0) if polls else False,
-        sleep_fn=lambda _s: None,
-        clock=lambda: 0.0,
+        sleep_fn=clock.sleep,
+        clock=clock,
         status_fn=status.append,
     )
     return emb, status
@@ -1200,8 +1971,8 @@ def test_status_line_updates_once_per_second_with_horizon() -> None:
         emb.step(Action(data=np.zeros(14)))
     updates = [m for m in status[reset_entries:] if m is not None]
     assert updates == [
-        "t = 1s / 120s | any key ends the episode",
-        "t = 2s / 120s | any key ends the episode",
+        "t = 1s / ~120s | wall 1s | any key ends the episode",
+        "t = 2s / ~120s | wall 2s | any key ends the episode",
     ]
 
 
@@ -1221,7 +1992,7 @@ def test_ticker_gesture_prose_belongs_to_the_session_when_connected(connected: b
 
     # Connected: rig state only, the session composes the end-gesture hint.
     # Defer-only: the session never sees our status, so we keep our own hint.
-    expected = "t = 1s" if connected else "t = 1s | Esc ends the episode"
+    expected = "t = 1s | wall 1s" if connected else "t = 1s | wall 1s | Esc ends the episode"
     assert status[reset_entries:] == [expected]
 
 
@@ -1233,6 +2004,88 @@ def test_status_line_without_hint_shows_elapsed_only() -> None:
         emb.step(Action(data=np.zeros(14)))
     updates = [m for m in status[reset_entries:] if m is not None]
     assert updates and "1s" in updates[0] and "/" not in updates[0].split("|")[0]
+
+
+def test_elapsed_follows_the_wall_clock_when_steps_overrun_the_period() -> None:
+    # 10 Hz, but every step burns another period beyond the pace (a settle, or
+    # a slow camera read). Counting steps would report 1s at step 10; the
+    # operator has actually been standing there for 2s.
+    clock = _PacedClock(overrun=0.1)
+    with pytest.warns(FutureWarning, match="max_steps_hint"):
+        cfg = YamConfig(max_steps_hint=1200)
+    emb, status = _build_with_status(cfg, clock=clock)
+    emb.reset(Scene(id="s", instruction="x"))
+    reset_entries = len(status)
+    started = clock.now
+
+    for _ in range(10):
+        emb.step(Action(data=np.zeros(14)))
+
+    # 10 steps that a step-count counter would call 1s, and the clock agrees
+    # they took 2s. The reported elapsed follows the clock.
+    assert clock.now - started == pytest.approx(2.0)
+    updates = [m for m in status[reset_entries:] if m is not None]
+    assert updates == ["t = 1s / ~120s | wall 2s | any key ends the episode"]
+
+
+def test_status_labels_large_wall_time_from_slow_policy_shape() -> None:
+    clock = _PacedClock(overrun=198.8)
+    with pytest.warns(FutureWarning, match="max_steps_hint"):
+        cfg = YamConfig(max_steps_hint=1200)
+    emb, status = _build_with_status(cfg, clock=clock)
+    emb.reset(Scene(id="s", instruction="x"))
+    reset_entries = len(status)
+    started = clock.now
+
+    for _ in range(10):
+        emb.step(Action(data=np.zeros(14)))
+
+    assert clock.now - started == pytest.approx(1989.0)
+    assert status[reset_entries:] == ["t = 1s / ~120s | wall 1989s | any key ends the episode"]
+
+
+@pytest.mark.parametrize("control_hz", [0.0, -1.0])
+def test_status_motion_uses_fallback_when_control_hz_is_nonpositive(control_hz: float) -> None:
+    clock = _PacedClock()
+    with pytest.warns(FutureWarning, match="max_steps_hint"):
+        cfg = YamConfig(control_hz=control_hz, max_steps_hint=1200)
+    emb, status = _build_with_status(cfg, clock=clock)
+    emb.reset(Scene(id="s", instruction="x"))
+    reset_entries = len(status)
+
+    for _ in range(10):
+        emb.step(Action(data=np.zeros(14)))
+
+    assert status[reset_entries:] == ["t = 1s | wall 0s | any key ends the episode"]
+
+
+def test_status_without_horizon_uses_motion_and_labeled_wall_format() -> None:
+    clock = _PacedClock(overrun=3.0)
+    emb, _ = _build_with_status(YamConfig(control_hz=1.0), clock=clock)
+    session = _RecordingSession()
+    emb.connect_operator_session(session)
+    emb.reset(Scene(id="s", instruction="x"))
+    reset_entries = len(session.statuses)
+
+    emb.step(Action(data=np.zeros(14)))
+
+    assert session.statuses[reset_entries:] == ["t = 1s | wall 4s"]
+
+
+def test_homing_time_is_not_charged_to_the_episode() -> None:
+    # reset() ramps the arms home before handing over, and that ramp sleeps.
+    # The operator's counter starts when the episode does, not at reset entry.
+    clock = _PacedClock()
+    emb, status = _build_with_status(YamConfig(control_hz=1.0), clock=clock)
+    emb.reset(Scene(id="s", instruction="x"))
+    homing_elapsed = clock.now
+    reset_entries = len(status)
+
+    emb.step(Action(data=np.zeros(14)))
+
+    assert homing_elapsed > 0.0  # the ramp really did consume fake time
+    updates = [m for m in status[reset_entries:] if m is not None]
+    assert updates == ["t = 1s | wall 1s | any key ends the episode"]
 
 
 def test_status_finishes_with_none_when_operator_ends_episode() -> None:
@@ -1278,7 +2131,7 @@ def test_deferred_status_explains_console_feedback_with_horizon() -> None:
 
     assert _running_status(status) == (
         "Running: Esc (or /stop) ends the episode; type a message + Enter to "
-        "send feedback. Max 120s."
+        "send feedback. Max ~120s."
     )
 
 
@@ -1292,7 +2145,7 @@ def test_connected_banner_carries_rig_facts_only() -> None:
 
     # No console prose: the session owns the end gesture and knows per policy
     # whether typed messages are delivered, so yam claims neither.
-    assert "Running. Max 120s." in session.statuses
+    assert "Running. Max ~120s." in session.statuses
     assert not any(s is not None and "ends the episode" in s for s in session.statuses)
 
 
@@ -1300,23 +2153,23 @@ def test_bind_task_drives_the_countdown_horizon() -> None:
     emb, status = _build_with_status()
     emb.bind_task(_Envelope(name="adhoc", max_steps=1200))
     emb.reset(Scene(id="s", instruction="x"))
-    assert "Max 120s." in _running_status(status)
+    assert "Max ~120s." in _running_status(status)
     reset_entries = len(status)
     for _ in range(10):
         emb.step(Action(data=np.zeros(14)))
     updates = [m for m in status[reset_entries:] if m is not None]
-    assert updates and "1s / 120s" in updates[0]
+    assert updates and "1s / ~120s" in updates[0]
 
 
 def test_bound_horizon_wins_over_deprecated_hint() -> None:
     with pytest.warns(FutureWarning, match="max_steps_hint"):
-        cfg = YamConfig(max_steps_hint=100)  # would show "Max 10s."
+        cfg = YamConfig(max_steps_hint=100)  # would show "Max ~10s."
     emb, status = _build_with_status(cfg)
     emb.bind_task(_Envelope(name="adhoc", max_steps=1200))
     emb.reset(Scene(id="s", instruction="x"))
     running = _running_status(status)
-    assert "Max 120s." in running
-    assert "Max 10s." not in running
+    assert "Max ~120s." in running
+    assert "Max ~10s." not in running
 
 
 def test_rebind_latest_envelope_wins() -> None:
@@ -1324,7 +2177,7 @@ def test_rebind_latest_envelope_wins() -> None:
     emb.bind_task(_Envelope(name="first", max_steps=100))
     emb.bind_task(_Envelope(name="second", max_steps=1200))
     emb.reset(Scene(id="s", instruction="x"))
-    assert "Max 120s." in _running_status(status)
+    assert "Max ~120s." in _running_status(status)
 
 
 def test_close_clears_the_bound_horizon() -> None:
@@ -1430,7 +2283,7 @@ def test_step_tracks_far_target_at_step_limits() -> None:
     ("cfg", "gripper_indices"),
     [
         (YamConfig(), (6, 13)),
-        (YamConfig(control_interface="eef_pos"), (4, 9)),
+        (YamConfig(control_interface="eef_pos"), (6, 13)),
     ],
     ids=["joint-pos", "eef-abs-pose"],
 )

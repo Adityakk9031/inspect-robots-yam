@@ -218,11 +218,61 @@ The stream is unauthenticated, and the default `0.0.0.0` bind listens on all
 interfaces. Use `--bind <tailscale-ip>` to limit it to the rig's tailnet
 address.
 
+## Named start poses: capture and reuse a rig setup
+
+Capture a joint-space start pose by bringing the arms up in gravity-compensation
+mode, moving both arms and grippers by hand, and pressing Enter:
+
+```bash
+inspect-robots-yam-pose capture table-ready --notes "bowls placed for pouring"
+```
+
+The command writes `poses/table-ready.json` by default. It prompts you to
+support both arms before closing the driver and releasing torque. Pass `--park`
+to gate and ramp to the configured rest pose first, or `--clamp` to explicitly
+clamp arm joints that are outside the configured limits. Gripper readings are
+always normalized to the portable 0 to 1 range.
+
+Each file is plain JSON with the packed left-then-right 14-slot joint layout:
+
+```json
+{
+  "schema": 1,
+  "name": "table-ready",
+  "joints": [0.12, 0.65, 1.04, -0.31, 0.08, 0.0, 0.72, -0.1, 0.7, 0.98, -0.28, -0.05, 0.02, 0.68],
+  "created_at": "2026-08-19T19:30:00+00:00",
+  "notes": "bowls placed for pouring",
+  "rig": "rig-1"
+}
+```
+
+Use the pose for an eval by setting its name on the embodiment:
+
+```bash
+inspect-robots "pour the pasta into the bowl" \
+    --embodiment yam_arms -E start_pose=table-ready
+```
+
+Set `pose_dir` in `[embodiment.args]`, pass `-E pose_dir=...`, or use the pose
+tool's `--pose-dir` flag to select another store. Commit `poses/` with a rig
+configuration or copy the directory between compatible rigs to share poses.
+The normalized gripper slots remain portable across different native gripper
+calibrations.
+
+> [!WARNING]
+> Before using a new pose in an unattended eval, run
+> `inspect-robots-yam-pose goto table-ready` and verify the full ramp while
+> ready on the e-stop. The straight-line joint interpolation checks configured
+> joint limits, but it does not perform collision checking.
+
 ## Run on hardware
 
 Write your defaults once. The interactive wizard interviews this plugin's
 declared devices (three cameras and both arms' CAN channels) with live
-probes, including unplug-to-identify:
+probes, including unplug-to-identify. It also offers the `auto_start`,
+`collision_guardrail`, `report_joint_eff`, and `eef_orientation` boolean
+options. The `eef_orientation` option applies to `eef_pos` rigs and reminds
+you to raise the `eef_low` z floor after opening tilt axes:
 
 ```bash
 inspect-robots setup
@@ -252,6 +302,42 @@ right_depth_serial = YOUR-RIGHT-D405-SERIAL
 EOF
 ```
 
+### Repeat one task N times with a human in the loop
+
+`scripts/run_batch.sh` runs the same task N times from a rig directory (a
+directory holding a `./run` wrapper and its `config.ini`). Type the prompt,
+policy, and effort once; everything except `-n` is forwarded to `./run`:
+
+```bash
+cd ~/robocurve/rig-1
+../inspect-robots-yam/scripts/run_batch.sh -n 20 \
+    --instruction "Place the fork on the plate" -P model=claude-opus-5 -P effort=medium
+```
+
+Each trial is a separate `./run` process with `--epochs 1` forced. That
+process asks the operator for a verdict after the episode (the grading pause),
+then parks the arms and releases torque on exit. Only then does the script ask
+you to reset the scene; the next trial, which powers the arms back on and
+ramps to the start pose, begins when you press Enter (`q` stops the batch).
+Keystrokes typed while the arms were parking are discarded before that prompt.
+A trial that does not exit cleanly gets a warning instead of the torque-off
+claim and asks whether to continue: check the arms are limp before reaching in.
+Ctrl-C cancels the running trial (the framework writes a cancelled log and
+parks) and ends the batch. Per-trial verdicts are read from the eval logs into
+`<log-dir>/batches/<stamp>.tsv`, echoed after each trial, and tallied at the end.
+
+Right before each trial launches, after you confirm the reset and before the
+arms power on, the script saves one top-camera JPEG of the scene to
+`<log-dir>/batches/batch_<stamp>/trial_NN_<run-id>_start.jpg` (the run id is
+appended once the eval log exists). It reads `top_cam_device` from
+`config.ini` (or `-E top_cam_device=...`) and opens it with OpenCV from the
+shared venv the way the plugin's V4L2 reader does. A camera failure warns and
+never blocks the trial; `--no-snapshots` turns it off.
+
+Any other `--epochs` value is rejected on purpose: within one process the arms
+stay connected and torque-held at the home pose between epochs while you reach
+into the scene.
+
 ### RealSense depth
 
 Install the optional librealsense dependency on the robot machine:
@@ -273,6 +359,18 @@ from the motor-control interpreter; `realsense_capture = inline` restores the
 in-process reader as a debugging escape hatch. `depth_fps` (default 30) sets
 both stream rates — devices accept only their discrete rates (D435/D405:
 6/15/30/60/90).
+
+Both camera paths capture at `capture_width × capture_height` (default
+640 × 480) and then resize to `cam_width × cam_height`; intrinsics are scaled
+from the capture size. Policies that need every pixel, such as AprilTag
+detection of small tags, set both pairs to the same full size
+(`capture_width = 1920`, `capture_height = 1080`, `cam_width = 1920`,
+`cam_height = 1080`). Devices accept only their discrete sizes: D435 colour
+goes to 1920 × 1080 but its depth stream tops out at 1280 × 720, so give depth
+its own size with `depth_capture_width = 1280`, `depth_capture_height = 720`
+(both or neither; default: same as colour). Depth is aligned to the colour
+frame, so the published depth array is always colour-sized. An unsupported
+combination fails at pipeline start with the librealsense error.
 
 Cameras open lazily, so the first `reset()` has a one-time warm-up cost while
 the pipelines start and deliver their first frames. A RealSense opened through
@@ -304,8 +402,9 @@ operator session, press Enter at either readiness gate, then press Esc (or
 type `/stop`) to end the episode; typed lines become policy feedback or
 logged notes.
 On the never-connected legacy path, press Enter at the gates and press any key
-to end the episode. In both modes the status counts up against the run's real
-step limit (`t = 42s / 120s`) with no configuration needed (requires
+to end the episode. In both modes the status shows motion-budget consumption
+against the run's real step limit, with separately labeled wall time
+(`t = 42s / ~120s | wall 75s`), and needs no configuration (requires
 inspect-robots newer than 0.8.1; on older cores set `max_steps_hint`).
 
 To skip both Enter gates, set `auto_start=true` (CLI: `-E auto_start=true`,
@@ -418,32 +517,52 @@ off requires an explicit `--disable-guardrails`.
 
 ### Cartesian EEF mode
 
-For LLM-agent runs, opt into the 10-D absolute Cartesian interface:
+For LLM-agent runs, opt into the 14-D absolute Cartesian interface:
 
 ```ini
 [embodiment.args]
 control_interface = eef_pos
 ```
 
-Each arm is controlled as `x, y, z, yaw, gripper`. Positions are metres in
-that arm's own base frame, with +x forward from the base and +z up. The two
-base frames are independent. On common mirrored bimanual mounts, the arms'
-+y axes point in opposite world directions, so equal signed y targets do not
-mean equal world directions.
+Each arm is controlled as `x, y, z, yaw, pitch, roll, gripper`. Positions are
+metres in that arm's own base frame, with +x forward from the base and +z up.
+The two base frames are independent. On common mirrored bimanual mounts, the
+arms' +y axes point in opposite world directions, so equal signed y targets do
+not mean equal world directions.
 
-Yaw is an absolute target relative to the orientation captured at reset:
-`0` means the reset orientation. It rotates about base +z while preserving the
-captured roll and pitch. Yaw interpolation does not wrap. A move from `3.1` to
+All three orientation slots are absolute targets relative to the orientation
+captured at reset: `0, 0, 0` means the reset orientation. Yaw rotates about
+base +z (positive counterclockwise from above); positive pitch tips the tool
+forward (+x at yaw 0); positive roll tips it toward the arm's left (+y at
+yaw 0). Orientation interpolation does not wrap. A yaw move from `3.1` to
 `-3.1` sweeps through zero instead of taking the short path, so use
 intermediate yaw targets for near-±π regrasps.
 
 The default workspace per arm is x `[0.15, 0.48]`, y `[-0.25, 0.25]`, and z
-`[0.03, 0.40]`, with yaw `[-π, π]` and gripper `[0, 1]`. These bounds were
-validated against the bundled YAM + LINEAR_4310 model at the default working
-orientation, but they are a conservative box rather than an exact reachable
-set. `eef_low` and `eef_high` override all ten bounds. The observation keeps
-the 14-D `joint_pos` field for logging and adds the command-aligned 10-D
-`eef_state` field.
+`[0.03, 0.40]`, with yaw `[-π, π]`, pitch and roll pinned at `[0, 0]`,
+and gripper `[0, 1]`. Pinned axes are declared but not commandable. The
+default behaves exactly like the historical yaw-only interface. Opening
+pitch and roll is supported through `eef_orientation=true`, which widens each
+exactly `0,0` pitch pin to `[-0.6, 0.6]` and roll pin to `[-π/2, π/2]` in the
+effective `eef_low`/`eef_high` bounds. The rewrite also applies when the tuples
+contain tuned position bounds. Custom orientation bounds remain supported:
+pitch must stay strictly inside `(-π/2, π/2)` and roll within `[-π, π]`.
+With `eef_orientation=true`, a `0,0` pitch or roll pin is widened. To re-pin
+one, set `eef_orientation=false` or pin it at a nonzero epsilon. See the
+z-floor WARNING below before opening either axis. These bounds were validated
+against the bundled YAM + LINEAR_4310 model at the default working orientation,
+but they are a conservative box rather than an exact reachable set. `eef_low`
+and `eef_high` override all fourteen bounds. The observation keeps the 14-D
+`joint_pos` field for logging and adds the command-aligned 14-D `eef_state`
+field.
+
+> [!WARNING]
+> The z floor (`z >= 0.03`) protects *fingertips* assuming a gripper-down
+> tool. A pitched or rolled gripper can reach the table with its knuckles or
+> wrist camera at a legal fingertip z. When opening pitch or roll, raise the
+> z lower bound to cover the tilted gripper body. The run warning checks open
+> axes only. A deliberate nonzero tilt pin has the same knuckles-first hazard
+> but does not trigger that warning, so its operator must still raise z.
 
 In both control interfaces, `home_pose=None` selects a mandatory per-mode
 factory default instead of skipping homing. Joint mode uses the
@@ -452,7 +571,10 @@ and both grippers open. EEF mode uses `DEFAULT_EEF_HOME_POSE`; its provisional
 per-arm joints are `[-0.024, 0.794, 0.645, -0.375, -0.021, -0.012]`, with both
 grippers open. The first EEF reset validates that the configured home FK lies
 in the workspace box before moving, then captures each arm's yaw reference
-after homing.
+after homing. Named `start_pose` poses work in EEF mode too: the resolved
+joint-space pose must start inside the EEF action box (grasp-point position,
+gripper aperture, and relative yaw/pitch/roll 0), and a reconnect revalidates
+the re-read pose file.
 
 > [!WARNING]
 > EEF mode has no arm-table or arm-arm collision checking. The workspace box,
@@ -573,18 +695,21 @@ motions, or replace the operator and physical e-stop.
 ## Safety
 
 - **Hard clamp backstop.** Every command is clipped to `YamConfig.joint_low/high`
-  *inside* `step()`, independent of any Inspect Robots `Approver`: unclamped model
-  outputs can never reach the motors. **Set the arm slots to your real YAM joint
-  limits** (the defaults are conservative placeholders: joints ±π, gripper 0–1).
-  But note the limits are in *policy units* per the table below: gripper slots 6
-  and 13 stay normalized 0–1, only slots 0–5 and 7–12 are radians.
+  and per-step `YamConfig.step_limits` *inside* `step()`, independent of any
+  Inspect Robots `Approver`: unclamped model outputs can never reach the motors.
+  **Set the arm slots to your real YAM joint limits** (the defaults are conservative
+  placeholders: joints ±π, gripper 0–1). But note the limits are in *policy units*
+  per the table below: gripper slots 6 and 13 stay normalized 0–1, only slots 0–5
+  and 7–12 are radians.
 - **Use `ClampApprover`** on hardware for a second layer.
 - **Zero-gravity handoff jump.** The arms connect in zero-gravity mode by default
   (`YamConfig(zero_gravity_mode=True)`, passed through to the i2rt driver).
-  Homing and rest-pose motions ramp at `control_hz`, but the first *policy*
-  action in joint mode is still a stiff PD command that can jump from wherever
-  the arm ended up. Nothing bounds the per-step joint delta in absolute joint
-  mode yet (tracked as a known issue). EEF mode applies a 0.2-rad-per-joint
+  Homing and rest-pose motions ramp at `control_hz` with guaranteed arrival. Every
+  command path enforces a per-step delta clamp (`YamConfig.step_limits`, default
+  0.2 rad/step), preventing violent leaps on the first stiff PD command out of
+  zero-g or during wild policy actions. If the arm starts outside configured
+  limits, the delta clamp walks the arm back toward the valid range at no more
+  than `step_limits` per tick. EEF mode additionally applies a 0.2-rad-per-joint
   per-step IK backstop, but a six-joint branch transit can still move the EEF
   tens of centimetres because rate-clamped intermediate configurations are not
   IK solutions. Reset always moves the arms through the full homing ramp, and
@@ -611,6 +736,11 @@ motions, or replace the operator and physical e-stop.
   parks with both grippers open (wire 1), so parking releases anything still
   held during the ramp, wherever the arms happen to be. Rigs that must keep an
   object gripped at park should override `rest_pose` with gripper slots 0.0.
+  With `park_before_grade=true`, the arms also make the same motion as the
+  `close()` park at episode end, before grading. This is a new time for that
+  motion and there is no stand-clear gate. Tasks whose success state is the
+  gripper holding an object must set `park_before_grade=false` so the grader
+  uses the last step's frames instead.
   Override both `home_pose` and `rest_pose` on rigs whose joint limits exclude
   zero, since both targets are clamped through the same per-joint box as every
   command.
@@ -655,13 +785,15 @@ motions, or replace the operator and physical e-stop.
 Hardware gripper units (via `gripper_open`/`gripper_closed`) exist only at the
 driver boundary; pose and limit vectors never use driver-native gripper units.
 
-In `control_interface="eef_pos"`, actions and `eef_low`/`eef_high` are 10-D:
+In `control_interface="eef_pos"`, actions and `eef_low`/`eef_high` are 14-D:
 
 | Slots | Meaning | Unit |
 |-------|---------|------|
-| 0–2, 5–7 | left / right EEF x, y, z in each arm's base frame | metres |
-| 3, 8 | left / right yaw relative to reset orientation | radians |
-| 4, 9 | left / right gripper | normalized 0–1 (1 = open, 0 = closed) |
+| 0–2, 7–9 | left / right EEF x, y, z in each arm's base frame | metres |
+| 3, 10 | left / right yaw relative to reset orientation | radians |
+| 4, 11 | left / right pitch relative to reset orientation (pinned at 0 by default) | radians |
+| 5, 12 | left / right roll relative to reset orientation (pinned at 0 by default) | radians |
+| 6, 13 | left / right gripper | normalized 0–1 (1 = open, 0 = closed) |
 
 `home_pose`, `rest_pose`, joint limits, and parking remain 14-D joint-space
 vectors in both control interfaces.
@@ -687,6 +819,12 @@ attended episode flow; needs a TTY; `unattended` takes precedence),
 `report_joint_eff` (default `False`; add the optional `joint_eff` observation
 state with sign-corrected estimated torque in raw N·m, including the gripper
 slots),
+`park_before_grade` (default `True`; park for an unobstructed final grader view;
+set `False` for tasks whose success state is the gripper holding an object so
+grading uses the last step's frames),
+`eef_orientation` (default `False`; widen exactly zero-pinned EEF pitch and
+roll bounds to conservative ranges; set it back to `False` or use a nonzero
+epsilon to re-pin, and raise the EEF z floor as described above),
 `collision_guardrail` (default `True`; predictive holds in absolute joint
 mode; the setup wizard suggests `false` until the base positions below are
 measured),
@@ -695,6 +833,8 @@ measured),
 geometry), `collision_table` (default `True`; set `False` for no table plane),
 `collision_table_height`, `collision_penetration_threshold` (optional collision
 model overrides),
+`motor_temp_limit` (degrees C; `none` by default, which disables the thermal
+guardrail), `motor_temp_warn_margin` (degrees C below the limit; default `10.0`),
 `settle_tolerance` (radians; `none` by default, which disables settling; see
 *Settling before observing*), `settle_timeout_s` (default `1.0`),
 `settle_timeout_budget` (default `20`),
@@ -709,6 +849,20 @@ line the real horizon automatically; the hint is only a fallback for direct
 The current factory value is available for inspection as
 `inspect_robots_yam.config.DEFAULT_REST_POSE`; this is an informational constant,
 not a stable import.
+
+The thermal guardrail compares `motor_temp_limit` with the hotter of the MOS
+and rotor readings for every arm and gripper motor. At episode start, a motor
+at the limit refuses the reset before the arms move. During an episode, a
+confirmed over-limit reading ends the trial with `overheat` while the motors
+still have torque, allowing the normal grading flow to run. Before returning,
+the trip parks to rest immediately in every mode, including ungraded and
+unattended runs and when `park_before_grade=false`. Thermal safety outranks
+that flag's scene-preservation preference. The setup wizard offers
+`motor_temp_limit` (suggested `70`; answer `none` to leave it off). Run
+`inspect-robots-yam-health` after a long episode to see the hottest motor, then
+choose a limit comfortably below the temperature where the firmware has
+faulted on that rig.
+
 `ActServerConfig`: `server_url`, `remedy` (connection-failure recovery
 instruction; defaults to the policy entry's canonical server launch command
 plus a docs link), `endpoint`, `num_steps` (the wire field: the server's
@@ -775,8 +929,10 @@ scorers and custom sinks; they are not written to the JSON eval log.
 > demand still hands back whatever the driver queued earlier, so a settled arm
 > can be photographed mid-motion however tight the tolerance.
 
-With settling on, the operator status line and its `Max ...s` horizon count steps
-rather than wall-clock seconds, so both understate real elapsed time (#64).
+The operator status line reads its elapsed time from the wall clock, so it stays
+true with settling on. The `Max ~...s` horizon is still a step budget divided by
+`control_hz`, which is why it is printed with a leading tilde: remaining step
+duration is not knowable in advance, and settling makes steps run long (#64).
 
 ## Development
 

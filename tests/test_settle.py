@@ -126,6 +126,7 @@ def test_timeout_bounded_by_poll_count_when_the_clock_is_frozen(
     # The frozen clock can never satisfy the elapsed bound, so the poll count is
     # the only thing that ends the loop. Without it this test would hang.
     assert driver.reads - reads_before == MAX_POLLS + 2  # _send + 100 polls + _observe
+    assert sleeps.count(POLL_S) == MAX_POLLS - 1
     assert result.info["settled"] is False
     assert result.info["settle_timeouts"] == 1
 
@@ -145,6 +146,7 @@ def test_timeout_bounded_by_elapsed_time_when_reads_cost_time(
     # short of the 100-poll cap: elapsed is the only reason the loop stopped.
     expected = int(1.0 / READ_ADVANCE_S)
     assert driver.reads - reads_before == expected + 2  # _send + polls + _observe
+    assert expected < MAX_POLLS
     assert result.info["settled"] is False
 
 
@@ -301,7 +303,7 @@ def test_eef_settles_against_the_commanded_pose_not_the_request(build_settle: An
     emb.reset(Scene(id="s", instruction="go"))
     sleeps.clear()
 
-    result = emb.step(Action(data=np.full(10, 0.3)))
+    result = emb.step(Action(data=np.full(14, 0.3)))
 
     assert result.info["settled"] is True
     assert sleeps == [PACE_S]  # nothing to wait for: the arm was already there

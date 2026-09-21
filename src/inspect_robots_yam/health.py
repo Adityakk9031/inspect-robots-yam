@@ -120,9 +120,23 @@ class HealthReport:
         return all(result.ok for result in (*self.cameras, *self.joints))
 
 
-def _default_reader_factory(name: str, device: str) -> HealthCameraReader:
-    """Build one inert OpenCV reader for one named device."""
-    return embodiment._OpenCVCameraReader({name: device})
+def _default_reader_factory(
+    name: str, device: str, *, capture_size: tuple[int, int] = (640, 480)
+) -> HealthCameraReader:
+    """Build one inert OpenCV reader for one named device at ``capture_size``."""
+    return embodiment._OpenCVCameraReader({name: device}, capture_size=capture_size)
+
+
+def _reader_factory_for(cfg: YamConfig, reader_factory: ReaderFactory) -> ReaderFactory:
+    """Bind the default factory to the rig's configured capture size; keep injected ones."""
+    if reader_factory is not _default_reader_factory:
+        return reader_factory
+    size = (cfg.capture_width, cfg.capture_height)
+
+    def factory(name: str, device: str) -> HealthCameraReader:
+        return _default_reader_factory(name, device, capture_size=size)
+
+    return factory
 
 
 def _default_write_montage(
@@ -217,10 +231,18 @@ def _run_motors(
     joint_epsilon: float,
     driver_factory: embodiment.DriverFactory,
 ) -> tuple[CheckResult, ...]:
+    temperatures: npt.NDArray[np.float64] | None = None
+    temperature_detail: str | None = None
     try:
         driver = driver_factory(cfg)
         try:
             positions = packing.validate_dim(driver.get_joint_pos())
+            get_motor_temps = getattr(driver, "get_motor_temps", None)
+            if callable(get_motor_temps):
+                try:
+                    temperatures = packing.validate_dim(get_motor_temps())
+                except Exception as exc:
+                    temperature_detail = f"unavailable: {exc}"
         finally:
             driver.close()
     except Exception as exc:
@@ -241,6 +263,22 @@ def _run_motors(
         else:
             detail = ""
         results.append(CheckResult(name=name, ok=not detail, detail=detail))
+    if temperature_detail is not None:
+        results.append(CheckResult(name="temps", ok=True, detail=temperature_detail))
+    elif temperatures is not None:
+        valid = np.flatnonzero(temperatures > 0)
+        if not valid.size:
+            detail = "no data"
+        else:
+            hottest = int(valid[int(np.argmax(temperatures[valid]))])
+            detail = f"max {temperatures[hottest]:g} C @ {packing.DIM_LABELS[hottest]}"
+        results.append(
+            CheckResult(
+                name="temps",
+                ok=True,
+                detail=detail,
+            )
+        )
     return tuple(results)
 
 
@@ -258,6 +296,7 @@ def run_health(
     sleep_fn: Callable[[float], None] = time.sleep,
 ) -> HealthReport:
     """Run the requested checks once and release every constructed hardware handle."""
+    reader_factory = _reader_factory_for(cfg, reader_factory)
     cameras_configured = bool(_camera_devices(cfg))
     cameras_skipped = skip_cameras or not cameras_configured
     unchecked_cameras = _unchecked_depth_cameras(cfg)

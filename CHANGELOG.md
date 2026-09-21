@@ -6,11 +6,116 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## Unreleased
 
+### Added
+
+- `capture_width` / `capture_height` (default 640 × 480, unchanged behaviour)
+  set the native size requested from the cameras on both the RealSense and the
+  V4L2 paths, with intrinsics scaled from that size. Rigs that need every pixel
+  (AprilTag detection for `inspect-robots-jev`) can now capture colour at
+  1920 × 1080; `depth_capture_width` / `depth_capture_height` run the RealSense
+  depth stream at its own size (a D435 tops out at 1280 × 720 depth) and the
+  `yam-health` / `--watch` probes follow the configured size
+  ([plan 0032](plans/0032-configurable-capture-resolution.md)).
+
+- An opt-in motor thermal guardrail checks every arm and gripper before reset
+  motion and before each step, warns as the configured limit approaches, and
+  ends a hot trial on the grading screen while torque remains. This avoids the
+  DM firmware cutoff that can strand an arm limp in its current pose. The rig
+  health report now shows its hottest motor to guide threshold selection
+  (#144).
+
+- The setup wizard now offers `motor_temp_limit`, suggests 70 degrees C for a
+  fresh setup, and accepts `none` to leave the thermal guardrail off. The
+  `YamConfig` runtime default remains `None` for backward compatibility (#150).
+
+- `scripts/run_batch.sh`: repeat one task N times from a rig directory with a
+  human in the loop. Each trial is its own `./run` process with `--epochs 1`
+  forced, so the framework's grading prompt pauses for the operator and the
+  arms are parked with torque released before the script asks for a scene
+  reset; the next trial starts on Enter, after discarding keystrokes typed
+  during the park ramp. A trial that exits uncleanly gets a check-the-arms
+  warning instead of the torque-off claim. Per-trial verdicts are pulled from
+  the eval logs into `<log-dir>/batches/<stamp>.tsv`, echoed per trial, and
+  tallied at the end. Before each trial launches it saves a top-camera JPEG of
+  the reset scene as `batch_<stamp>/trial_NN_<run-id>_start.jpg`
+  (`--no-snapshots` to skip). Any other `--epochs` value is rejected because
+  within-process epochs hold torque at home between trials.
+
+### Fixed
+
+- The operator status line now compares motion-budget seconds with the
+  estimated motion horizon and shows elapsed wall time as a separate labeled
+  value. Slow policy calls therefore remain visible without making the budget
+  numerator race ahead of its step-based denominator (#148).
+
+- The operator's elapsed counter now reads the wall clock instead of the step
+  count. It was `num_steps / control_hz`, which is only the truth while every
+  step fits inside its control period. A step can already overrun that on a slow
+  camera read, and `settle_tolerance` makes overrun routine, at which point an
+  operator watching a hardware run could see 30s reported after 90 real seconds
+  had passed. Homing is excluded: the clock starts when `reset()` hands the
+  episode over. The horizon is unchanged but now renders as `Max ~120s` and
+  `t = 30s / ~120s`, because remaining step duration is not knowable in advance
+  and dividing the step budget by `control_hz` is an estimate rather than a
+  deadline (#64).
+
+### Changed
+
+- Every command path inside `YAMEmbodiment._send()` now enforces per-step joint delta
+  limits (`YamConfig.step_limits`, default 0.2 rad/step per arm joint), bounding
+  commanded motion on all modes including the first stiff PD command out of zero-g.
+  When starting outside configured joint limits, the delta clamp walks the arm back
+  toward valid bounds at no more than `step_limits` per step. `_ramp_to()` guarantees
+  target arrival by dynamically sizing ramp steps to satisfy `step_limits` (#2, #26).
+
+- A mid-run thermal trip now ramps the arms to their rest pose from inside
+  `step()` before terminating, including ungraded and unattended runs and when
+  `park_before_grade=false`. The returned observation still captures the trip
+  pose before parking (#150).
+
+- The minimum `inspect-robots` version is now 0.58. The setup wizard's numeric
+  `motor_temp_limit` prompt depends on the `NumberSlot` protocol first shipped
+  in that release. The thermal guardrail's park-before-grading behavior also
+  depends on the framework's `observe_parked` lifecycle from 0.57 (#150).
+
+- **Breaking (EEF layout):** the Cartesian interface grows from 5 to 7 slots
+  per arm — `x, y, z, yaw, pitch, roll, gripper`, 14 total. Old→new per-arm
+  slot mapping: x/y/z/yaw keep slots 0–3, gripper moves 4→6, and pitch/roll
+  occupy the new slots 4/5 (right arm starts at slot 7, was 5). Affects
+  `eef_low`/`eef_high` config strings, `eef_state` observations, logged EEF
+  actions, and `EEF_DIM_LABELS`. Pitch and roll ship **pinned at (0, 0)** —
+  behavior at default bounds is identical to the yaw-only interface; open an
+  axis by widening its bounds (pitch strictly inside (-π/2, π/2), roll within
+  [-π, π]). Orientation slots are relative to the reset orientation; positive
+  pitch tips the tool forward, positive roll toward the arm's left. Equality
+  in `eef_low`/`eef_high` now means a pinned axis (previously rejected). The
+  relative-rotation extraction supersedes the near-vertical yaw fallback
+  (`_ArmKinematics.yaw_axis` is gone) and reports identical yaw inside the
+  yaw-only family (#133).
+
+### Added
+
+- The opt-in `YamConfig.eef_orientation` field and setup-wizard option widen
+  zero-pinned EEF pitch and roll to conservative ranges. EEF-mode CLI runs now
+  warn when that rewrite is active, name orientation axes that remain pinned,
+  and flag open tilt axes whose arm still uses the fingertips-down default z
+  floor. Direct `rollout()` and `eval()` API runs and CLI runs with
+  `--disable-guardrails` do not emit these run-header warnings (#140).
+- Named start poses now work in EEF mode: the config-time veto is gone, the
+  resolved pose is validated against the EEF action box (FK grasp-point
+  position, gripper aperture, and relative yaw 0) before the homing ramp,
+  the box error names the offending pose, and a reconnect revalidates the
+  re-read pose file (#131).
+- Named joint-space start poses with the `inspect-robots-yam-pose` capture,
+  goto, list, show, delete, and rename workflows. Pose files use a versioned,
+  shareable JSON format with normalized grippers, while `YamConfig.start_pose`
+  resolves and validates a named pose before the arm driver connects (#128).
+
 ### Changed
 
 - Session-connected runs no longer author console prose: the running banner
   becomes "Running." plus the horizon and the per-second ticker sends bare rig
-  state ("t = 4s / 120s"). The framework session appends its own
+  state ("t = 4s / ~120s"). The framework session appends its own
   "Esc ends the episode" hint and replaces stale gesture clauses (inspect-robots
   plan 0062), so this text can never drift again when the framework gesture
   changes. Defer-only and never-connected modes keep their own text: the
