@@ -157,7 +157,7 @@ def test_camera_open_retries_and_succeeds_after_latency() -> None:
     reader, cv2, sleeps, _ = build(caps)
     reader(YamConfig())
 
-    assert retry_cap.attempts == 4
+    assert retry_cap.attempts == 3
     assert cv2.opened == ["/dev/cam0", "/dev/cam1", "/dev/cam1", "/dev/cam1", "/dev/cam2"]
     assert sleeps == [1.0, 1.0]
 

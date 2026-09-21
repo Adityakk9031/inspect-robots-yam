@@ -573,7 +573,6 @@ class _OpenCVCameraReader:
         A warm-up that never yields a frame is not fatal here, as before #63:
         the drain thread gets its own chance and ``_latest`` waits for it.
         """
-        cap = None
         for attempt in range(_CAMERA_OPEN_ATTEMPTS):
             cap = cv2.VideoCapture(device, cv2.CAP_V4L2)
             if cap.isOpened():
@@ -581,7 +580,7 @@ class _OpenCVCameraReader:
             cap.release()
             if attempt < _CAMERA_OPEN_ATTEMPTS - 1:
                 self._sleep(_CAMERA_OPEN_RETRY_S)
-        if cap is None or not cap.isOpened():
+        else:
             raise RuntimeError(
                 f"cannot open {name} at {device} after {_CAMERA_OPEN_ATTEMPTS} attempts"
             )
