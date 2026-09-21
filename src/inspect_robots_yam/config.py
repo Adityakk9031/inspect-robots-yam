@@ -123,11 +123,7 @@ class _FromKwargs:
 
 def validate_hold_limit(value: object, name: str = "collision_hold_limit") -> None:
     """Validate that a collision hold limit is a positive integer or None."""
-    if value is not None and (
-        not isinstance(value, int)
-        or isinstance(value, bool)
-        or value <= 0
-    ):
+    if value is not None and (not isinstance(value, int) or isinstance(value, bool) or value <= 0):
         raise ValueError(f"{name} must be a positive integer or None")
 
 

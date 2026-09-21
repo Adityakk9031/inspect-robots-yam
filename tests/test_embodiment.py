@@ -2298,4 +2298,3 @@ def test_disabled_collision_hold_limit_in_embodiment_allows_indefinite_holds() -
     for _ in range(60):
         r = emb.step(act_blocked)
         assert not r.terminated
-
