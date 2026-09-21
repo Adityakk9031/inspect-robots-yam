@@ -1751,7 +1751,8 @@ class YAMEmbodiment:
                     },
                 )
         self.num_steps += 1
-        if action.meta.get("collision_blocked"):
+        meta = getattr(action, "meta", None)
+        if isinstance(meta, dict) and meta.get("collision_blocked"):
             self._consecutive_collision_holds += 1
         else:
             self._consecutive_collision_holds = 0

@@ -274,11 +274,9 @@ class CollisionApprover:
         _validate_action_space(action_space)
         if on_violation not in ("hold", "abort"):
             raise ValueError("on_violation must be 'hold' or 'abort'")
-        effective_limit: int | None
-        if hold_limit is _INHERIT:
-            effective_limit = checker.config.hold_limit
-        else:
-            effective_limit = hold_limit  # type: ignore[assignment]
+        effective_limit: int | None = (
+            checker.config.hold_limit if hold_limit is _INHERIT else hold_limit  # type: ignore[assignment]
+        )
         validate_hold_limit(effective_limit, "hold_limit")
         self._checker = checker
         self._start_pose = validate_dim(start_pose, TOTAL_DIM).copy()
